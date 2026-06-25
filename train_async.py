@@ -1,9 +1,24 @@
+import os
+
 import ray
 
 from slime.ray.placement_group import create_placement_groups, create_rollout_manager, create_training_models
+from slime.ray.utils import add_default_ray_env_vars
 from slime.utils.arguments import parse_args
 from slime.utils.logging_utils import configure_logger, finish_tracking, init_tracking
 from slime.utils.misc import should_run_periodic_action
+
+
+def _init_ray_for_driver():
+    """Connect to an existing cluster when RAY_ADDRESS is set (VERL sbatch pattern)."""
+    if ray.is_initialized():
+        return
+    ray_address = os.environ.get("RAY_ADDRESS")
+    if ray_address:
+        ray.init(
+            address=ray_address,
+            runtime_env={"env_vars": add_default_ray_env_vars()},
+        )
 
 
 # The framework supports other asynchronous approaches such as fully async (which is shown in examples/full_async).
@@ -77,4 +92,5 @@ def train(args):
 
 if __name__ == "__main__":
     args = parse_args()
+    _init_ray_for_driver()
     train(args)

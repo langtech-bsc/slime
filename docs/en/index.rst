@@ -60,6 +60,8 @@ Start by Use Case
 
    examples/qwen3-4B.md
    examples/glm4-9B.md
+   examples/salamandra-7b-cispo.md
+   examples/salamandra-7b-cispo-downloads.md
 
 .. toctree::
    :maxdepth: 1

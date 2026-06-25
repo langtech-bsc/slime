@@ -79,7 +79,7 @@ NUM_ROLLOUT=2 ROLLOUT_BATCH_SIZE=4 GLOBAL_BATCH_SIZE=16 SAVE_INTERVAL=9999 \
 
 ### Multi-node Ray (VERL-style)
 
-On MN5, from rl-training root: `sbatch scripts/mn5/sbatch_salamandra-7B-cispo-smoke.sh`. It starts Ray head/workers with `srun` + Singularity (same pattern as `Salamandra-rl/quick_start/sbatch_cispo.sh`), then launches training with **`python3 train_async.py` directly** — not `ray job submit`. Set `RAY_ADDRESS=${head_ip}:6379` and `SLIME_SCRIPT_EXTERNAL_RAY=1`; `train_async.py` calls `ray.init(address=RAY_ADDRESS)` like VERL's `run_ppo()`.
+On MN5, from rl-training root: `sbatch scripts/mn5/sbatch_salamandra-7B-cispo.sh`. It starts Ray head/workers with `srun` + Singularity (same pattern as `Salamandra-rl/quick_start/sbatch_cispo.sh`), then launches training with **`python3 train_async.py` directly** — not `ray job submit`. Set `RAY_ADDRESS=${head_ip}:6379` and `SLIME_SCRIPT_EXTERNAL_RAY=1`; `train_async.py` calls `ray.init(address=RAY_ADDRESS)` like VERL's `run_ppo()`.
 
 Manual cluster (1 actor node × 4 GPU + 3 rollout nodes × 4 GPU):
 
@@ -143,5 +143,9 @@ Launcher: [rl-training/scripts/run-salamandra-7B-cispo-async.sh](https://github.
 ```text
 Actor (4 GPU, Megatron TP=4)  ←── train_async.py
 Rollout (12 GPU, 6 × SGLang TP=2)  ←── fully_async_rollout worker
-Weight sync every rollout step (update_weights_interval=1)
+Weight sync every rollout step (`update_weights_interval=1`). Samples with
+`trainer_weight_version - rollout_weight_version > 3` are discarded at train
+time via `--max-rollout-weight-staleness 3` (override with `MAX_ROLLOUT_WEIGHT_STALENESS`).
+Logged metrics: `rollout_weight_staleness/discarded`, `rollout_weight_staleness/discard_ratio`,
+`train/rollout_weight_staleness_discarded`.
 ```

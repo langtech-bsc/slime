@@ -20,6 +20,10 @@ from slime.utils.logging_utils import init_tracking
 from slime.utils.memory_utils import clear_memory, print_memory
 from slime.utils.misc import Box
 from slime.utils.reloadable_process_group import destroy_process_groups, monkey_patch_torch_dist, reload_process_groups
+from slime.utils.rollout_staleness import (
+    discard_stale_rollout_samples,
+    log_rollout_weight_staleness_metrics,
+)
 from slime.utils.routing_replay import RoutingReplay
 from slime.utils.timer import Timer, inverse_timer, timer, with_defer
 from slime.utils.types import RolloutBatch
@@ -226,6 +230,13 @@ class MegatronTrainRayActor(TrainRayActor):
             mpu.get_data_parallel_rank(with_context_parallel=False),
             mpu.get_data_parallel_world_size(with_context_parallel=False),
         )
+        if self.args.max_rollout_weight_staleness is not None and self.role == "actor":
+            staleness_stats = discard_stale_rollout_samples(
+                rollout_data,
+                trainer_weight_version=self.weight_updater.weight_version,
+                max_staleness=self.args.max_rollout_weight_staleness,
+            )
+            rollout_data["rollout_weight_staleness_stats"] = staleness_stats
         # TODO: this is ugly, move to somewhere else?
         # move tokens to GPU in advance
         device = torch.cuda.current_device()
@@ -508,6 +519,16 @@ class MegatronTrainRayActor(TrainRayActor):
 
             if self.rollout_data_postprocess is not None:
                 self.rollout_data_postprocess(self.args, rollout_id, rollout_data)
+
+            staleness_stats = rollout_data.pop("rollout_weight_staleness_stats", None)
+            if staleness_stats is not None and self.args.max_rollout_weight_staleness is not None:
+                log_rollout_weight_staleness_metrics(
+                    rollout_id,
+                    self.args,
+                    staleness_stats,
+                    trainer_weight_version=self.weight_updater.weight_version,
+                    max_staleness=self.args.max_rollout_weight_staleness,
+                )
 
             log_rollout_data(
                 rollout_id,

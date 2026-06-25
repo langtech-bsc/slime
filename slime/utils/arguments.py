@@ -506,6 +506,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Interval for updating the weights",
             )
             parser.add_argument(
+                "--max-rollout-weight-staleness",
+                type=int,
+                default=None,
+                help=(
+                    "Discard rollout samples at train time when "
+                    "trainer_weight_version - rollout_weight_version exceeds this value. "
+                    "Disabled when unset."
+                ),
+            )
+            parser.add_argument(
                 "--keep-old-actor",
                 action="store_true",
                 help="Whether to keep the rollout model on training process",

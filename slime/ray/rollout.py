@@ -821,6 +821,9 @@ class RolloutManager:
         if samples[0].teacher_log_probs is not None:
             train_data["teacher_log_probs"] = [sample.teacher_log_probs for sample in samples]
 
+        if any(sample.weight_versions for sample in samples):
+            train_data["weight_versions"] = [sample.weight_versions for sample in samples]
+
         return train_data
 
     def set_train_parallel_config(self, config: dict):
@@ -866,6 +869,7 @@ class RolloutManager:
                 "sample_indices",
                 "rollout_ids",
                 "rollout_mask_sums",
+                "weight_versions",
                 "rollout_log_probs",
                 "rollout_top_p_token_ids",
                 "rollout_top_p_token_offsets",

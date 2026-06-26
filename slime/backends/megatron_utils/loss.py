@@ -485,8 +485,8 @@ def get_log_probs_and_entropy(
     per-sample slicing) so backward traverses ``[T, V]`` only once, then
     extracts per-sample response portions.
 
-    When ``entropy_coef == 0``, entropy is computed under ``torch.no_grad()``
-    to avoid retaining the computation graph and to skip cloning.
+    When ``entropy_coef == 0``, callers should pass ``with_entropy=False`` to
+    skip entropy and avoid an extra ``logits.clone()`` during training.
     """
     assert non_loss_data
     assert logits.dtype == torch.float32, f"{logits.dtype}"
@@ -910,13 +910,14 @@ def policy_loss_function(
     response_lengths = batch["response_lengths"]
     total_lengths = batch["total_lengths"]
 
+    with_entropy = args.entropy_coef != 0
     _, log_probs_and_entropy = get_log_probs_and_entropy(
         logits,
         args=args,
         unconcat_tokens=batch["unconcat_tokens"],
         total_lengths=total_lengths,
         response_lengths=response_lengths,
-        with_entropy=True,
+        with_entropy=with_entropy,
         **get_rollout_top_p_logprob_kwargs(args, batch),
     )
 
@@ -1039,10 +1040,12 @@ def policy_loss_function(
     pg_clipfrac = sum_of_sample_mean(pg_clipfrac)
     ppo_kl = sum_of_sample_mean(ppo_kl)
 
-    # entropy loss
-    entropy = log_probs_and_entropy["entropy"]
-    entropy = torch.cat(entropy, dim=0)
-    entropy_loss = sum_of_sample_mean(entropy)
+    # entropy loss (skipped when entropy_coef == 0 to avoid an extra logits.clone())
+    if with_entropy:
+        entropy = torch.cat(log_probs_and_entropy["entropy"], dim=0)
+        entropy_loss = sum_of_sample_mean(entropy)
+    else:
+        entropy_loss = pg_loss.new_zeros(())
 
     loss = pg_loss - args.entropy_coef * entropy_loss
 

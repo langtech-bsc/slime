@@ -264,6 +264,7 @@ def make_slime_validate_args(**overrides):
         reward_key="reward",
         dump_details=None,
         save_debug_rollout_data=None,
+        save_debug_rollout_data_max_per_group=None,
         save_debug_train_data=None,
         load_debug_rollout_data=None,
         rollout_external_engine_addrs=None,

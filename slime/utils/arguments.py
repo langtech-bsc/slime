@@ -318,6 +318,43 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--fully-async-generation-concurrency",
+                type=int,
+                default=None,
+                help=(
+                    "For slime.rollout.fully_async_rollout only: maximum number of sample generation "
+                    "requests in flight. Defaults to sglang_server_concurrency * number of rollout engines."
+                ),
+            )
+            parser.add_argument(
+                "--fully-async-reward-concurrency",
+                type=int,
+                default=None,
+                help=(
+                    "For slime.rollout.fully_async_rollout only: maximum number of reward computations "
+                    "in flight. Defaults to fully_async_generation_concurrency."
+                ),
+            )
+            parser.add_argument(
+                "--fully-async-max-reward-backlog-groups",
+                type=int,
+                default=None,
+                help=(
+                    "For slime.rollout.fully_async_rollout only: maximum number of generated groups waiting "
+                    "on rewards before the oldest unrewarded group is dropped. Defaults to 4 * rollout_batch_size."
+                ),
+            )
+            parser.add_argument(
+                "--fully-async-reward-frontier-groups",
+                type=int,
+                default=None,
+                help=(
+                    "For slime.rollout.fully_async_rollout only: number of oldest incomplete groups eligible "
+                    "for priority reward scheduling. Defaults to max_reward_backlog_groups, so all retained "
+                    "groups are scheduled oldest-first."
+                ),
+            )
+            parser.add_argument(
                 "--rollout-temperature",
                 type=float,
                 default=1.0,
@@ -1220,6 +1257,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "Save the rollout data to this path for debugging. "
                     "The file will be saved to `save_debug_rollout_data.format(rollout_id)`."
+                ),
+            )
+            parser.add_argument(
+                "--save-debug-rollout-data-max-per-group",
+                type=int,
+                default=None,
+                help=(
+                    "When saving debug rollout data, keep at most this many samples per prompt group. "
+                    "Groups are keyed by Sample.group_index when set, otherwise consecutive "
+                    "n_samples_per_prompt chunks. Unset saves every sample."
                 ),
             )
             # --load-debug-rollout-data, --debug-rollout-only, --debug-train-only

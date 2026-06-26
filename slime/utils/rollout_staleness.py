@@ -153,4 +153,9 @@ def _recompute_rollout_mask_sums(rollout_data: dict[str, Any]) -> None:
     rollout_total_mask: dict[int, int] = {}
     for rollout_id, mask_sum in zip(rollout_ids, mask_sums_per_sample, strict=True):
         rollout_total_mask[rollout_id] = rollout_total_mask.get(rollout_id, 0) + mask_sum
-    rollout_data["rollout_mask_sums"] = [rollout_total_mask[rollout_id] for rollout_id in rollout_ids]
+    recomputed = [rollout_total_mask[rollout_id] for rollout_id in rollout_ids]
+    original = rollout_data["rollout_mask_sums"]
+    if torch.is_tensor(original):
+        rollout_data["rollout_mask_sums"] = original.new_tensor(recomputed, dtype=torch.float32)
+    else:
+        rollout_data["rollout_mask_sums"] = torch.tensor(recomputed, dtype=torch.float32)

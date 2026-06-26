@@ -112,7 +112,7 @@ For checkpoint conversion on multi-node, see `slime/utils/external_utils/command
 | actor TP=4, `sequence_parallel` | `--tensor-model-parallel-size 4 --sequence-parallel` |
 | `use_dynamic_bsz`, `ppo_max_token_len_per_gpu: 8192` | `--use-dynamic-batch-size --max-tokens-per-gpu 8192` |
 | `log_prob_max_token_len_per_gpu: 8192` | `--log-probs-max-tokens-per-gpu 8192` |
-| rollout TP=2, `gpu_memory_utilization: 0.50` | `--rollout-num-gpus-per-engine 2 --sglang-mem-fraction-static 0.50` |
+| rollout TP=2, `gpu_memory_utilization: 0.75` | `--rollout-num-gpus-per-engine 2 --sglang-mem-fraction-static 0.75` |
 | `enforce_eager`, `enable_chunked_prefill`, FA3 | `--sglang-enforce-eager --sglang-chunked-prefill-size 4096 --sglang-attention-backend fa3` |
 | `n: 16`, lengths 4096 | `--n-samples-per-prompt 16`, `--rollout-max-prompt-len 4096`, `--rollout-max-response-len 4096` |
 | `reward_manager.name: dapo` | `--rm-type dapo` |
@@ -120,6 +120,8 @@ For checkpoint conversion on multi-node, see `slime/utils/external_utils/command
 | `partial_rollout` | `fully_async_rollout` (aborted samples recycled) |
 
 Launcher: [rl-training/scripts/run-salamandra-7B-cispo-async.sh](https://github.com/langtech-bsc/rl-training/blob/main/scripts/run-salamandra-7B-cispo-async.sh)
+
+Optional rollout prompt/response dumps (debug only, **off by default**): set `SAVE_ROLLOUT_EXAMPLES=1`. See [rl-training/docs/rollout_examples.md](../../../../docs/rollout_examples.md).
 
 ## Explicitly excluded from VERL config
 

@@ -33,4 +33,4 @@ def test_discard_stale_rollout_samples_zeros_masks_and_recomputes_rollout_totals
     assert stats == RolloutStalenessStats(discarded=1, eligible=2, unknown_version=0)
     assert rollout_data["loss_masks"][0].sum().item() == 0
     assert rollout_data["loss_masks"][1].sum().item() == 2
-    assert rollout_data["rollout_mask_sums"] == [2, 2]
+    assert rollout_data["rollout_mask_sums"].tolist() == [2, 2]

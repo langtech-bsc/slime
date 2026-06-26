@@ -673,13 +673,28 @@ class RolloutManager:
 
             # TODO may improve the format
             if evaluation:
-                dump_data = dict(
-                    samples=[sample.to_dict() for dataset_name, info in data.items() for sample in info["samples"]]
-                )
+                samples = [
+                    sample for dataset_name, info in data.items() for sample in info["samples"]
+                ]
             else:
-                dump_data = dict(
-                    samples=[sample.to_dict() for sample in data],
+                samples = data
+
+            max_per_group = self.args.save_debug_rollout_data_max_per_group
+            if max_per_group is not None:
+                original_count = len(samples)
+                samples = _limit_debug_rollout_samples(
+                    samples,
+                    max_per_group=max_per_group,
+                    n_samples_per_prompt=self.args.n_samples_per_prompt,
                 )
+                logger.info(
+                    "Save debug rollout data with max_per_group=%s: %s -> %s samples",
+                    max_per_group,
+                    original_count,
+                    len(samples),
+                )
+
+            dump_data = dict(samples=[sample.to_dict() for sample in samples])
 
             torch.save(dict(rollout_id=rollout_id, **dump_data), path)
 
@@ -1293,6 +1308,33 @@ def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any]
     logging_utils.log(args, log_dict, step_key="eval/step")
 
     return log_dict
+
+
+def _limit_debug_rollout_samples(
+    samples: list[Sample],
+    *,
+    max_per_group: int,
+    n_samples_per_prompt: int,
+) -> list[Sample]:
+    if max_per_group <= 0:
+        return []
+    if not samples:
+        return samples
+
+    if any(sample.group_index is not None for sample in samples):
+        grouped = group_by(samples, lambda sample: sample.group_index)
+        limited = []
+        for group_index in sorted(grouped.keys(), key=lambda key: (key is None, key)):
+            limited.extend(grouped[group_index][:max_per_group])
+        return limited
+
+    if n_samples_per_prompt > 0:
+        limited = []
+        for offset in range(0, len(samples), n_samples_per_prompt):
+            limited.extend(samples[offset : offset + n_samples_per_prompt][:max_per_group])
+        return limited
+
+    return samples[:max_per_group]
 
 
 def _log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_time):

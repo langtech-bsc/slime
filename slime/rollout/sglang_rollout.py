@@ -220,7 +220,7 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
 
 
 @trace_function("generate_and_rm", target="sample")
-async def generate_and_rm(
+async def generate_sample_only(
     args: Namespace,
     sample: Sample | list[Sample],
     sampling_params: dict[str, Any],
@@ -258,6 +258,18 @@ async def generate_and_rm(
                     sample = await custom_generate_func(args, sample, sampling_params)
             else:
                 sample = await generate(args, sample, sampling_params)
+
+    return sample
+
+
+@trace_function("generate_and_rm", target="sample")
+async def generate_and_rm(
+    args: Namespace,
+    sample: Sample | list[Sample],
+    sampling_params: dict[str, Any],
+    evaluation: bool = False,
+) -> Sample | list[Sample]:
+    sample = await generate_sample_only(args, sample, sampling_params, evaluation=evaluation)
 
     # for the rm that need the whole group, we will not do the rm here
     if args.group_rm:

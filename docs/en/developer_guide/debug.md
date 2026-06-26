@@ -46,6 +46,8 @@ Specifically, slime currently provides the following parameters for separate deb
 
     When enabled, the results of each rollout will be saved. This can be used in conjunction with `--debug-rollout-only`. Note that the data is saved using the format: `args.save_debug_rollout_data.format(rollout_id=rollout_id)`.
 
+    Optional: `--save-debug-rollout-data-max-per-group N` keeps at most `N` samples per prompt group (e.g. `1` for one completion per prompt). rl-training documents the Salamandra opt-in env `SAVE_ROLLOUT_EXAMPLES` in [rollout_examples.md](../../../../docs/rollout_examples.md); keep dumps **off** for production training.
+
 4.  `--load-debug-rollout-data /your/saved/debug/data_{rollout_id}.pt`
 
     When enabled, data will be loaded from `args.load_debug_rollout_data.format(rollout_id=rollout_id)`, and SGLang will not be initialized (automatically setting `debug_train_only=True`). This method allows you to fix the input for the training part to tune it, for example, by switching between different parallelization strategies.

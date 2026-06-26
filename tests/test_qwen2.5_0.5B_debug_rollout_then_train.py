@@ -93,7 +93,8 @@ def execute_rollout_only(debug_data_dir: str):
         f"{_common_args(debug_data_dir)} "
         f"{sglang_args} "
         "--debug-rollout-only "
-        f"--save-debug-rollout-data {debug_data_dir}/rollout_{{rollout_id}}.pt "
+        f"--rollout-dump-local-dir {debug_data_dir} "
+        f"--rollout-dump-gpfs-dir {debug_data_dir} "
     )
 
     print("=" * 60)
@@ -112,7 +113,7 @@ def execute_train_only(debug_data_dir: str):
 
     phase2_args = (
         f"{_common_args(debug_data_dir)} "
-        f"--load-debug-rollout-data {debug_data_dir}/rollout_{{rollout_id}}.pt "
+        f"--load-debug-rollout-data {debug_data_dir}/rollout_{{rollout_id}} "
         "--ci-test "
     )
 

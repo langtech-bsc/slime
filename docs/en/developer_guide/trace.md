@@ -6,22 +6,14 @@ slime can attach lightweight execution traces to each rollout sample. These trac
 
 ## Save rollout trace data
 
-To inspect traces later, save rollout debug data during a run:
-
-```bash
-python train.py \
-    ... \
-    --save-debug-rollout-data /path/to/debug/rollout_{rollout_id}.pt
-```
-
-Each saved `.pt` file contains the rollout samples together with their `trace` payloads. You can also replay the same dump later with `--load-debug-rollout-data`.
+Rollout dumps are always written during training under `{--save}/rollout_dumps/rollout_{rollout_id}/` (chunked ~128 MiB target parts + `manifest.json`). Eval rollouts use `rollout_eval_{rollout_id}/`. Each part contains rollout samples together with their `trace` payloads. Replay with `--load-debug-rollout-data /path/to/rollout_{rollout_id}`.
 
 ## Open the timeline viewer
 
 Use the trace viewer script on a saved rollout dump:
 
 ```bash
-python tools/trace_timeline_viewer.py /path/to/debug/rollout_0.pt
+python tools/trace_timeline_viewer.py /path/to/rollout_dumps/rollout_0/part_000.pt
 ```
 
 The script generates:

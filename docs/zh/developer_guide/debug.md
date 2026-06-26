@@ -36,17 +36,23 @@ slime 支持将训练部分和推理部分分开进行调试，从而实现：
 
    开启后，slime 将不会加载 megatron，只初始化 sglang ，可以用这个方法来进行推理部分的调试。
 
-1. `--debug-train-only`
+2. `--debug-train-only`
 
    开启后，slime 将不会加载 sglang，只初始化 megatron ，可以用这个方法来进行训练部分的调试。
 
-2. `--save-debug-rollout-data /your/saved/debug/data_{rollout_id}.pt`
+3. **Rollout dump（训练时默认开启）**
 
-   开启后，会保存每次 rollout 的结果，可以和 `--debug-rollout-only` 配合使用。注意保存的方式为 `args.save_debug_rollout_data.format(rollout_id=rollout_id)`。
+   每次 rollout 会**异步**保存**全部**样本：
 
-3. `--load-debug-rollout-data /your/saved/debug/data_{rollout_id}.pt`
+   - **本地（快）**：节点 NVMe，`/scratch/$USER/slime_rollout_dumps/$SLURM_JOB_ID/rollout_{rollout_id}/`
+   - **GPFS（尽力同步）**：`{--save}/rollout_dumps/rollout_{rollout_id}/`，约 128 MiB 分片 + `manifest.json`
+   - **评估 rollout**：`rollout_eval_{rollout_id}/`（例如 `rollout_eval_3/`）
 
-   开启后，会从 `args.load_debug_rollout_data.format(rollout_id=rollout_id)` 来加载数据，并且不会初始化 sglang（自动设置 `debug_train_only=True`）。可以以这种方式来固定训练部分的输入，对训练部分进行调优，例如切换各种并行。
+   分片大小为**目标值**（默认 128 MiB），单个超大样本可能使某个 part 超过该值。可用 `--rollout-dump-local-dir`、`--rollout-dump-gpfs-dir` 覆盖路径，`--rollout-dump-chunk-bytes` 调整分片大小，或 `--dump-details DIR` 将 rollout/train debug 数据写到同一目录树下。
+
+4. `--load-debug-rollout-data /your/saved/debug/rollout_{rollout_id}`
+
+   开启后，会从 `args.load_debug_rollout_data.format(rollout_id=rollout_id)` 加载数据（分片目录或旧版单个 `.pt`），并且不会初始化 sglang（自动设置 `debug_train_only=True`）。可以以这种方式来固定训练部分的输入，对训练部分进行调优，例如切换各种并行。
 
 ## INT4 / Compressed-Tensors 量化 Checkpoint 问题
 

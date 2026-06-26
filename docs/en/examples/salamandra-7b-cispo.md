@@ -110,18 +110,18 @@ For checkpoint conversion on multi-node, see `slime/utils/external_utils/command
 | `use_rollout_log_probs` + `rollout_correction.bypass_mode` | `--use-rollout-logprobs` |
 | `use_kl_loss: False` | omit `--use-kl-loss` |
 | actor TP=4, `sequence_parallel` | `--tensor-model-parallel-size 4 --sequence-parallel` |
-| `use_dynamic_bsz`, `ppo_max_token_len_per_gpu: 8192` | `--use-dynamic-batch-size --max-tokens-per-gpu 8192` |
-| `log_prob_max_token_len_per_gpu: 8192` | `--log-probs-max-tokens-per-gpu 8192` |
+| `use_dynamic_bsz`, `ppo_max_token_len_per_gpu: 16384` | `--use-dynamic-batch-size --max-tokens-per-gpu 16384` |
+| `log_prob_max_token_len_per_gpu: 16384` | `--log-probs-max-tokens-per-gpu 16384` |
 | rollout TP=2, `gpu_memory_utilization: 0.75` | `--rollout-num-gpus-per-engine 2 --sglang-mem-fraction-static 0.75` |
 | `enforce_eager`, `enable_chunked_prefill`, FA3 | `--sglang-enforce-eager --sglang-chunked-prefill-size 4096 --sglang-attention-backend fa3` |
-| `n: 16`, lengths 4096 | `--n-samples-per-prompt 16`, `--rollout-max-prompt-len 4096`, `--rollout-max-response-len 4096` |
+| `n: 16`, lengths 4096 / 12288 (16k context) | `--n-samples-per-prompt 16`, `--rollout-max-prompt-len 4096`, `--rollout-max-response-len 12288`, `--rollout-max-context-len 16384` |
 | `reward_manager.name: dapo` | `--rm-type dapo` |
 | `hybrid_engine: False`, async | `train_async.py`, no `--colocate` |
 | `partial_rollout` | `fully_async_rollout` (aborted samples recycled) |
 
 Launcher: [rl-training/scripts/run-salamandra-7B-cispo-async.sh](https://github.com/langtech-bsc/rl-training/blob/main/scripts/run-salamandra-7B-cispo-async.sh)
 
-Optional rollout prompt/response dumps (debug only, **off by default**): set `SAVE_ROLLOUT_EXAMPLES=1`. See [rl-training/docs/rollout_examples.md](../../../../docs/rollout_examples.md).
+Rollout prompt/response dumps are **always on** (async, under `{SAVE_DIR}/rollout_dumps/`). See [rl-training/docs/rollout_examples.md](../../../../docs/rollout_examples.md).
 
 ## Explicitly excluded from VERL config
 

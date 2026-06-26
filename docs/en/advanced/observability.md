@@ -90,10 +90,10 @@ If `--storage.tsdb.path` points to container-local disk, the data is lost when t
 
 ## Trace Viewer
 
-Debug rollout dumps saved with `--save-debug-rollout-data` include sample traces. The trace viewer reads SGLang timing attrs directly from those traces and uses `pd_*` fields to render synthetic `[P]` / `[D]` lanes.
+Rollout dumps are always written under `{--save}/rollout_dumps/rollout_{rollout_id}/` during training (eval: `rollout_eval_{rollout_id}/`).
 
 ```bash
-python tools/trace_timeline_viewer.py /path/to/debug/rollout_0.pt
+python tools/trace_timeline_viewer.py /path/to/rollout_dumps/rollout_0/part_000.pt
 ```
 
 The default path does not require separate `ReqTimeStats(...)` logs, Loki, or a compaction tool.

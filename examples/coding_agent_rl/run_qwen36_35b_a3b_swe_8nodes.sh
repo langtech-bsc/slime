@@ -131,7 +131,7 @@ ROLLOUT_ARGS=(
    --num-steps-per-rollout 1
    --global-batch-size 64
    --micro-batch-size 1
-   --save-debug-rollout-data "${RUN_ROOT}/rollout_dumps/rollout_{rollout_id}.pt"
+   # Rollout dumps are always written under ${RUN_ROOT}/rollout_dumps/ via --save.
 )
 
 PERF_ARGS=(

@@ -1251,23 +1251,27 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         # debug
         def add_debug_arguments(parser):
             parser.add_argument(
-                "--save-debug-rollout-data",
+                "--rollout-dump-local-dir",
                 type=str,
                 default=None,
                 help=(
-                    "Save the rollout data to this path for debugging. "
-                    "The file will be saved to `save_debug_rollout_data.format(rollout_id)`."
+                    "Override node-local rollout dump root (default: /scratch/$USER/slime_rollout_dumps/$SLURM_JOB_ID)."
                 ),
             )
             parser.add_argument(
-                "--save-debug-rollout-data-max-per-group",
-                type=int,
+                "--rollout-dump-gpfs-dir",
+                type=str,
                 default=None,
                 help=(
-                    "When saving debug rollout data, keep at most this many samples per prompt group. "
-                    "Groups are keyed by Sample.group_index when set, otherwise consecutive "
-                    "n_samples_per_prompt chunks. Unset saves every sample."
+                    "Override GPFS rollout dump root (default: {--save}/rollout_dumps). "
+                    "Each rollout is written to rollout_{rollout_id}/ with ~128 MiB parts."
                 ),
+            )
+            parser.add_argument(
+                "--rollout-dump-chunk-bytes",
+                type=int,
+                default=128 * 1024 * 1024,
+                help="Target size per rollout dump part file in bytes (default: 128 MiB).",
             )
             # --load-debug-rollout-data, --debug-rollout-only, --debug-train-only
             # are parsed early in _pre_parse_mode() and merged later.
@@ -1276,14 +1280,13 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=str,
                 default=None,
                 help=(
-                    "Path (or {rollout_id} template) to a dumped rollout .pt file replayed by "
-                    "slime.rollout.forge_load.generate_rollout. Mirrors --load-debug-rollout-data's "
-                    "format(rollout_id=...) convention: a path without the placeholder is treated as "
-                    "a literal file and reused across every rollout_id; a path containing {rollout_id} "
-                    "loads a per-rollout file (with eval_<id>.pt for the eval pipeline). Unlike "
-                    "--load-debug-rollout-data, this does NOT force debug_train_only / skip_sglang -- "
-                    "sglang servers, router, weight_update and the colocate offload/onload dance all "
-                    "stay live, which is the point (memory measurement at long context)."
+                    "Path (or {rollout_id} template) to a dumped rollout replayed by "
+                    "slime.rollout.forge_load.generate_rollout. Supports chunked directories "
+                    "(rollout_{rollout_id}/ with manifest.json) and legacy single .pt files. "
+                    "Mirrors --load-debug-rollout-data's format(rollout_id=...) convention: a path "
+                    "without the placeholder is reused across every rollout_id; a path containing "
+                    "{rollout_id} loads per-rollout data (eval uses rollout_eval_{id}/). Unlike "
+                    "--load-debug-rollout-data, this does NOT force debug_train_only / skip_sglang."
                 ),
             )
             parser.add_argument(
@@ -1916,7 +1919,8 @@ def slime_validate_args(args):
         args.eval_reward_key = args.reward_key
 
     if args.dump_details is not None:
-        args.save_debug_rollout_data = f"{args.dump_details}/rollout_data/{{rollout_id}}.pt"
+        args.rollout_dump_local_dir = f"{args.dump_details}/rollout_data"
+        args.rollout_dump_gpfs_dir = f"{args.dump_details}/rollout_data"
         args.save_debug_train_data = f"{args.dump_details}/train_data/{{rollout_id}}_{{rank}}.pt"
 
     if args.load_debug_rollout_data is not None:

@@ -8,13 +8,14 @@ Plug in by setting:
 The path follows the same {rollout_id} format convention as
 --load-debug-rollout-data:
   - Literal path (recommended for memory tests):
-      --load-forge-rollout-data /path/to/forged_dump/rollout_data/0.pt
-    Every rollout reuses the same file (rollout_id is left untouched so
-    the framework's per-rollout bookkeeping still works).
-  - Template path (matches --save-debug-rollout-data layout):
-      --load-forge-rollout-data /path/to/dumps/{rollout_id}.pt
-    Each rollout loads its own file. If a rollout_id has no file we fall
-    back to 0.pt for the training path; eval has no equivalent fallback.
+      --load-forge-rollout-data /path/to/forged_dump/rollout_data/rollout_0
+    Every rollout reuses the same dump (rollout_id is left untouched so
+    the framework's per-rollout bookkeeping still works). Legacy single
+    `.pt` files are also supported.
+  - Template path (matches rollout dump directory layout):
+      --load-forge-rollout-data /path/to/dumps/rollout_{rollout_id}
+    Each rollout loads its own directory (chunked parts + manifest.json).
+    Legacy templates ending in `{rollout_id}.pt` are still accepted.
 
 Unlike --load-debug-rollout-data, this path does NOT set
 skip_sglang=True / debug_train_only=True (see
@@ -26,58 +27,64 @@ measuring real GPU memory.
 """
 
 import logging
-import os
 from pathlib import Path
 
-import torch
-
 from slime.rollout.base_types import RolloutFnEvalOutput, RolloutFnTrainOutput
+from slime.utils.rollout_dump_utils import load_rollout_dump, resolve_rollout_dump_load_path, rollout_dump_exists
 from slime.utils.types import Sample
 
 logger = logging.getLogger(__name__)
 
 
-def _resolve_path(args, rollout_id: int, evaluation: bool) -> str | None:
+def _template_variants(template: str) -> list[str]:
+    if "{rollout_id}" not in template:
+        return [template]
+    variants = [template]
+    if "{rollout_id}.pt" in template:
+        variants.append(template.replace("{rollout_id}.pt", "rollout_{rollout_id}"))
+    elif not template.endswith("rollout_{rollout_id}"):
+        variants.append(template.rstrip("/") + "/rollout_{rollout_id}")
+    return variants
+
+
+def _resolve_path(args, rollout_id: int, evaluation: bool) -> Path | None:
     tpl = getattr(args, "load_forge_rollout_data", None)
     if not tpl:
         raise RuntimeError(
             "--load-forge-rollout-data not set. Pass the dump path, "
-            "e.g. /path/to/rollout_data/0.pt (literal) or "
-            "/path/to/rollout_data/{rollout_id}.pt (template)."
+            "e.g. /path/to/rollout_data/rollout_0 (literal) or "
+            "/path/to/rollout_data/rollout_{rollout_id} (template)."
         )
-    # In literal-path mode (no {rollout_id} placeholder) we can't distinguish
-    # train vs eval files, so eval is a no-op. Use template mode if you want
-    # to also replay an eval dump (--load-forge-rollout-data .../{rollout_id}.pt
-    # with eval_<id>.pt files alongside the train ones).
     if evaluation and "{rollout_id}" not in tpl:
         return None
-    rid_str = ("eval_" if evaluation else "") + str(rollout_id)
-    path = tpl.format(rollout_id=rid_str)
-    if os.path.exists(path):
-        return path
-    # Fallback only for the training path: many memory tests have just 0.pt
-    # but want --num-rollout > 1. Eval has no equivalent fallback (we don't
-    # want to silently feed training samples to the eval pipeline).
+
+    for variant in _template_variants(tpl):
+        path = resolve_rollout_dump_load_path(variant, rollout_id, evaluation=evaluation)
+        if rollout_dump_exists(path):
+            return path
+
     if not evaluation:
-        fallback = tpl.format(rollout_id="0")
-        if os.path.exists(fallback):
-            logger.info("forge_load: %s missing, falling back to %s", path, fallback)
-            return fallback
+        for variant in _template_variants(tpl):
+            path = resolve_rollout_dump_load_path(variant, 0, evaluation=False)
+            if rollout_dump_exists(path):
+                logger.info("forge_load: rollout_id=%s missing, falling back to %s", rollout_id, path)
+                return path
     return None
+
+
+def _load_samples(path: Path) -> list[Sample]:
+    return [Sample.from_dict(sample) for sample in load_rollout_dump(path)]
 
 
 def generate_rollout(args, rollout_id, data_source, evaluation: bool = False):
     path = _resolve_path(args, rollout_id, evaluation)
 
     if evaluation:
-        # Eval is optional for a memory-test run. If no eval dump, no-op.
         if path is None:
             logger.info("forge_load: no eval dump found; returning empty eval result")
             return RolloutFnEvalOutput(data={})
         logger.info("forge_load: loading eval samples from %s", path)
-        blob = torch.load(path, weights_only=False)
-        samples = [Sample.from_dict(s) for s in blob["samples"]]
-        # See train-path note: don't overwrite rollout_id.
+        samples = _load_samples(path)
         reward_key = args.eval_reward_key or args.reward_key
         rewards = [s.reward if (not reward_key or s.reward is None) else s.reward[reward_key] for s in samples]
         return RolloutFnEvalOutput(
@@ -97,18 +104,11 @@ def generate_rollout(args, rollout_id, data_source, evaluation: bool = False):
         )
 
     logger.info("forge_load: loading samples from %s", path)
-    blob = torch.load(path, weights_only=False)
-    samples = [Sample.from_dict(s) for s in blob["samples"]]
-    # IMPORTANT: do NOT overwrite sample.rollout_id with the current rollout_id.
-    # Default-shape rollouts leave rollout_id=None and slime falls back to
-    # sample.index in slime/ray/rollout.py (the dp-schedule grouping key).
-    # Forcing all samples to share one rollout_id collapses them into a single
-    # "rollout", which trips the num_rollouts >= global_batch_size assert in
-    # slime/utils/dp_schedule.py.
+    samples = _load_samples(path)
     logger.info(
         "forge_load: loaded %d samples for rollout_id=%d from %s",
         len(samples),
         rollout_id,
-        Path(path).name,
+        path.name,
     )
     return RolloutFnTrainOutput(samples=samples)

@@ -44,8 +44,8 @@ Example:
 Fault tolerance is more useful when failures are reproducible. slime provides separate rollout-only and train-only debugging paths:
 
 - `--debug-rollout-only`: run rollout and save generated data without training;
-- `--save-debug-rollout-data /path/to/rollout_{rollout_id}.pt`: save rollout samples for later inspection or replay;
-- `--load-debug-rollout-data /path/to/rollout_{rollout_id}.pt`: replay saved rollout data and skip SGLang initialization;
+- Rollout dumps under `{--save}/rollout_dumps/rollout_{rollout_id}/` (eval: `rollout_eval_{rollout_id}/`): always saved during training for later inspection or replay;
+- `--load-debug-rollout-data /path/to/rollout_{rollout_id}`: replay saved rollout data (chunked directory or legacy `.pt`) and skip SGLang initialization;
 - `--debug-train-only`: run training-side logic without rollout.
 
 This lets you isolate whether a failure belongs to serving/rollout, data conversion, reward/verifier logic, or Megatron training.

@@ -90,10 +90,12 @@ def execute():
     )
 
     for i in range(2):
+        dump_dir = f"dump-{i}"
         U.execute_train(
             train_args=train_args
             + (
-                f"--save-debug-rollout-data data-{i}.pt "
+                f"--rollout-dump-local-dir {dump_dir} "
+                f"--rollout-dump-gpfs-dir {dump_dir} "
                 f"--ci-save-grad-norm grad_norms-{i}.pt "
                 f"--actor-num-gpus-per-node {NUM_GPUS} "
             ),
@@ -108,7 +110,7 @@ def execute():
                         if tp_size * pp_size * cp_size > num_gpus:
                             continue
                         args = train_args + (
-                            f"--load-debug-rollout-data data-{i}.pt "
+                            f"--load-debug-rollout-data {dump_dir}/rollout_{{rollout_id}} "
                             f"--ci-load-grad-norm grad_norms-{i}.pt "
                             f"--context-parallel-size {cp_size} "
                             f"--tensor-model-parallel-size {tp_size} "

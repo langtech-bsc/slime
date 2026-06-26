@@ -42,15 +42,19 @@ Specifically, slime currently provides the following parameters for separate deb
 
     When enabled, slime will not load SGLang and will only initialize Megatron. You can use this method to debug the training part.
 
-3.  `--save-debug-rollout-data /your/saved/debug/data_{rollout_id}.pt`
+3.  **Rollout dumps (always on during training)**
 
-    When enabled, the results of each rollout will be saved. This can be used in conjunction with `--debug-rollout-only`. Note that the data is saved using the format: `args.save_debug_rollout_data.format(rollout_id=rollout_id)`.
+    Every rollout step persists **all** generated samples asynchronously:
 
-    Optional: `--save-debug-rollout-data-max-per-group N` keeps at most `N` samples per prompt group (e.g. `1` for one completion per prompt). rl-training documents the Salamandra opt-in env `SAVE_ROLLOUT_EXAMPLES` in [rollout_examples.md](../../../../docs/rollout_examples.md); keep dumps **off** for production training.
+    - **Local (fast)**: node NVMe under `/scratch/$USER/slime_rollout_dumps/$SLURM_JOB_ID/rollout_{rollout_id}/`
+    - **GPFS (best-effort)**: `{--save}/rollout_dumps/rollout_{rollout_id}/` with ~128 MiB part files plus `manifest.json`
+    - **Eval rollouts**: `rollout_eval_{rollout_id}/` (e.g. `rollout_eval_3/`)
 
-4.  `--load-debug-rollout-data /your/saved/debug/data_{rollout_id}.pt`
+    Override roots with `--rollout-dump-local-dir` / `--rollout-dump-gpfs-dir`, or `--dump-details DIR` for debug bundles. Chunk size: `--rollout-dump-chunk-bytes` (default 128 MiB). Part size is a **target**; a single very large sample can produce a part larger than the limit.
 
-    When enabled, data will be loaded from `args.load_debug_rollout_data.format(rollout_id=rollout_id)`, and SGLang will not be initialized (automatically setting `debug_train_only=True`). This method allows you to fix the input for the training part to tune it, for example, by switching between different parallelization strategies.
+4.  `--load-debug-rollout-data /your/saved/debug/rollout_{rollout_id}`
+
+    When enabled, data will be loaded from `args.load_debug_rollout_data.format(rollout_id=rollout_id)` (directory with chunked parts, or legacy single `.pt`), and SGLang will not be initialized (automatically setting `debug_train_only=True`). This method allows you to fix the input for the training part to tune it, for example, by switching between different parallelization strategies.
 
 ## INT4 / Compressed-Tensors Quantization Checkpoint Issues
 

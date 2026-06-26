@@ -91,7 +91,7 @@ ROLLOUT_ARGS=(
    --rollout-max-context-len 96000
    --rollout-max-response-len 32768
    --rollout-stop-token-ids 248046 248044
-   --save-debug-rollout-data "${RUN_ROOT}/rollout_dumps/rollout_{rollout_id}.pt"
+Rollout dumps are always written under `${RUN_ROOT}/rollout_dumps/` when `--save` points at `RUN_ROOT`.
 )
 ```
 

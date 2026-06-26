@@ -25,6 +25,7 @@ from slime.utils.http_utils import _wrap_ipv6, find_available_port, get_host_inf
 from slime.utils.logging_utils import configure_logger, init_tracking
 from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step, compute_statistics, dict_add_prefix
 from slime.utils.misc import Box, group_by, load_function
+from slime.utils.rollout_dump_utils import AsyncRolloutDumper, RolloutDumpJob, load_rollout_dump, resolve_rollout_dump_load_path
 from slime.utils.types import Sample
 
 from ..utils.metric_utils import has_repetition
@@ -471,6 +472,8 @@ class RolloutManager:
                     self._health_monitors.append(monitor)
             self._ci_fault_injection_pending = self.args.ci_test  # Flag for CI fault injection
 
+        self._rollout_dumper = AsyncRolloutDumper.from_args(self.args)
+
     def _try_ci_fault_injection(self):
         """Try to inject fault during generate (when health monitor is running)."""
         if not self._ci_fault_injection_pending:
@@ -500,6 +503,7 @@ class RolloutManager:
     def dispose(self):
         for monitor in self._health_monitors:
             monitor.stop()
+        self._rollout_dumper.close()
         logging_utils.finish_tracking(self.args)
 
     @property
@@ -634,10 +638,11 @@ class RolloutManager:
 
     def _get_rollout_data(self, rollout_id):
         if self.args.load_debug_rollout_data:
-            data = torch.load(
-                self.args.load_debug_rollout_data.format(rollout_id=rollout_id),
-                weights_only=False,
-            )["samples"]
+            load_path = resolve_rollout_dump_load_path(
+                self.args.load_debug_rollout_data,
+                rollout_id,
+            )
+            data = load_rollout_dump(load_path)
             data = [Sample.from_dict(sample) for sample in data]
             if (ratio := self.args.load_debug_rollout_data_subsample) is not None:
                 original_num_rows = len(data)
@@ -665,38 +670,23 @@ class RolloutManager:
         return data, metrics
 
     def _save_debug_rollout_data(self, data, rollout_id, evaluation: bool):
-        # TODO to be refactored (originally Buffer._set_data)
-        if (path_template := self.args.save_debug_rollout_data) is not None:
-            path = Path(path_template.format(rollout_id=("eval_" if evaluation else "") + str(rollout_id)))
-            logger.info(f"Save debug rollout data to {path}")
-            path.parent.mkdir(parents=True, exist_ok=True)
+        if self.args.load_debug_rollout_data:
+            return
 
-            # TODO may improve the format
-            if evaluation:
-                samples = [
-                    sample for dataset_name, info in data.items() for sample in info["samples"]
-                ]
-            else:
-                samples = data
+        if evaluation:
+            samples = [sample for dataset_name, info in data.items() for sample in info["samples"]]
+        else:
+            samples = data
 
-            max_per_group = self.args.save_debug_rollout_data_max_per_group
-            if max_per_group is not None:
-                original_count = len(samples)
-                samples = _limit_debug_rollout_samples(
-                    samples,
-                    max_per_group=max_per_group,
-                    n_samples_per_prompt=self.args.n_samples_per_prompt,
-                )
-                logger.info(
-                    "Save debug rollout data with max_per_group=%s: %s -> %s samples",
-                    max_per_group,
-                    original_count,
-                    len(samples),
-                )
-
-            dump_data = dict(samples=[sample.to_dict() for sample in samples])
-
-            torch.save(dict(rollout_id=rollout_id, **dump_data), path)
+        rollout_key = ("eval_" if evaluation else "") + str(rollout_id)
+        self._rollout_dumper.enqueue(
+            RolloutDumpJob(
+                rollout_key=rollout_key,
+                rollout_id=rollout_id,
+                evaluation=evaluation,
+                samples=[sample.to_dict() for sample in samples],
+            )
+        )
 
     def _post_process_rewards(self, samples: list[Sample] | list[list[Sample]]):
         if self.custom_reward_post_process_func is not None:
@@ -1308,33 +1298,6 @@ def _log_eval_rollout_data(rollout_id, args, data, extra_metrics: dict[str, Any]
     logging_utils.log(args, log_dict, step_key="eval/step")
 
     return log_dict
-
-
-def _limit_debug_rollout_samples(
-    samples: list[Sample],
-    *,
-    max_per_group: int,
-    n_samples_per_prompt: int,
-) -> list[Sample]:
-    if max_per_group <= 0:
-        return []
-    if not samples:
-        return samples
-
-    if any(sample.group_index is not None for sample in samples):
-        grouped = group_by(samples, lambda sample: sample.group_index)
-        limited = []
-        for group_index in sorted(grouped.keys(), key=lambda key: (key is None, key)):
-            limited.extend(grouped[group_index][:max_per_group])
-        return limited
-
-    if n_samples_per_prompt > 0:
-        limited = []
-        for offset in range(0, len(samples), n_samples_per_prompt):
-            limited.extend(samples[offset : offset + n_samples_per_prompt][:max_per_group])
-        return limited
-
-    return samples[:max_per_group]
 
 
 def _log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_time):

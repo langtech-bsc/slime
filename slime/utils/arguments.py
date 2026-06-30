@@ -355,6 +355,24 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--fully-async-max-inference-groups",
+                type=int,
+                default=8,
+                help=(
+                    "For slime.rollout.fully_async_rollout only: maximum number of prompt groups with "
+                    "in-flight generation requests at once."
+                ),
+            )
+            parser.add_argument(
+                "--fully-async-max-reward-groups",
+                type=int,
+                default=8,
+                help=(
+                    "For slime.rollout.fully_async_rollout only: maximum number of prompt groups with "
+                    "in-flight reward computation at once."
+                ),
+            )
+            parser.add_argument(
                 "--rollout-temperature",
                 type=float,
                 default=1.0,

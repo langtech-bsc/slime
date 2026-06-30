@@ -76,12 +76,22 @@ def _get_global_worker(args, data_buffer) -> AsyncRolloutWorker:
                 getattr(args, "fully_async_reward_frontier_groups", None)
                 or max_reward_backlog_groups
             )
-            if generation_concurrency < 1 or reward_concurrency < 1 or max_reward_backlog_groups < 1:
+            max_inference_groups = args.fully_async_max_inference_groups
+            max_reward_groups = args.fully_async_max_reward_groups
+            if (
+                generation_concurrency < 1
+                or reward_concurrency < 1
+                or max_reward_backlog_groups < 1
+                or max_inference_groups < 1
+                or max_reward_groups < 1
+            ):
                 raise ValueError(
-                    "fully async rollout requires positive generation/reward concurrency and reward backlog limits; "
+                    "fully async rollout requires positive generation/reward concurrency and backlog limits; "
                     f"got generation_concurrency={generation_concurrency}, "
                     f"reward_concurrency={reward_concurrency}, "
-                    f"max_reward_backlog_groups={max_reward_backlog_groups}"
+                    f"max_reward_backlog_groups={max_reward_backlog_groups}, "
+                    f"max_inference_groups={max_inference_groups}, "
+                    f"max_reward_groups={max_reward_groups}"
                 )
             if reward_frontier_groups < 1:
                 raise ValueError(
@@ -95,6 +105,8 @@ def _get_global_worker(args, data_buffer) -> AsyncRolloutWorker:
                 reward_concurrency=reward_concurrency,
                 max_reward_backlog_groups=max_reward_backlog_groups,
                 reward_frontier_groups=reward_frontier_groups,
+                max_inference_groups=max_inference_groups,
+                max_reward_groups=max_reward_groups,
             )
             _global_worker.start()
         return _global_worker
@@ -111,6 +123,31 @@ def _stop_global_worker() -> None:
 atexit.register(_stop_global_worker)
 
 
+def _inference_active_group_ids(
+    groups: dict[int, "GroupState"],
+    pending_generation: deque[tuple[int, int, Sample]],
+    active_generation: dict[asyncio.Task, tuple[int, int]],
+) -> set[int]:
+    gids = {gid for gid, _, _ in pending_generation}
+    gids.update(gid for _, (gid, _) in active_generation.items())
+    gids.update(
+        gid
+        for gid, group in groups.items()
+        if not group.dropped and group.generated_count < len(group.samples)
+    )
+    return gids
+
+
+def _reward_serving_group_ids(groups: dict[int, "GroupState"]) -> set[int]:
+    return {
+        gid
+        for gid, group in groups.items()
+        if not group.dropped
+        and group.rewarded_count < len(group.samples)
+        and (group.active_reward_count > 0 or group.rewarded_count > 0)
+    }
+
+
 class AsyncRolloutWorker:
     """Background thread + asyncio loop with separate generation and RM pools."""
 
@@ -122,6 +159,8 @@ class AsyncRolloutWorker:
         reward_concurrency: int,
         max_reward_backlog_groups: int,
         reward_frontier_groups: int | None = None,
+        max_inference_groups: int = 8,
+        max_reward_groups: int = 8,
     ):
         self.args = args
         self.data_buffer = data_buffer
@@ -129,6 +168,8 @@ class AsyncRolloutWorker:
         self.reward_concurrency = reward_concurrency
         self.max_reward_backlog_groups = max_reward_backlog_groups
         self.reward_frontier_groups = reward_frontier_groups or max_reward_backlog_groups
+        self.max_inference_groups = max_inference_groups
+        self.max_reward_groups = max_reward_groups
         self.running = True
         self.training_output_queue = TrainingOutputQueue()
         self.reward_computation_tracker = RewardComputationTracker()
@@ -185,6 +226,11 @@ class AsyncRolloutWorker:
 
                 self._publish_ready_groups(groups)
                 self._refresh_backlog_metrics(groups)
+                self.metrics.inference_active_groups = len(
+                    _inference_active_group_ids(groups, pending_generation, active_generation)
+                )
+                serving_gids = _reward_serving_group_ids(groups)
+                self.metrics.reward_active_groups = len(serving_gids)
                 warned_high_backlog = self._maybe_log_backlog_warning(groups, warned_high_backlog)
                 now = time.time()
                 if now - last_reward_queue_log >= 30.0:
@@ -223,7 +269,10 @@ class AsyncRolloutWorker:
                 )
 
                 while len(active_reward) < self.reward_concurrency and pending_reward:
-                    item = self._pop_next_pending_reward(pending_reward, groups)
+                    allowed_gids = None
+                    if len(serving_gids) >= self.max_reward_groups:
+                        allowed_gids = serving_gids
+                    item = self._pop_next_pending_reward(pending_reward, groups, allowed_gids=allowed_gids)
                     if item is None:
                         break
                     gid, sample_idx, sample_or_group = item
@@ -231,9 +280,15 @@ class AsyncRolloutWorker:
                     group_state.active_reward_count += len(sample_or_group) if isinstance(sample_or_group, list) else 1
                     task = asyncio.create_task(self._reward_sample_or_group(sample_or_group))
                     active_reward[task] = (gid, sample_idx)
+                    serving_gids = _reward_serving_group_ids(groups)
 
                 while len(active_generation) < self.generation_concurrency and self.running:
                     while not pending_generation:
+                        if (
+                            len(_inference_active_group_ids(groups, pending_generation, active_generation))
+                            >= self.max_inference_groups
+                        ):
+                            break
                         fetched = self.data_buffer.get_samples(1)
                         if not fetched:
                             break
@@ -351,6 +406,7 @@ class AsyncRolloutWorker:
         self,
         pending_reward: deque[tuple[int, int | None, Sample | list[Sample]]],
         groups: dict[int, "GroupState"],
+        allowed_gids: set[int] | None = None,
     ) -> tuple[int, int | None, Sample | list[Sample]] | None:
         if not pending_reward:
             return None
@@ -370,6 +426,8 @@ class AsyncRolloutWorker:
             group = groups.get(gid)
             if group is None or group.dropped:
                 stale_indices.append(index)
+                continue
+            if allowed_gids is not None and gid not in allowed_gids:
                 continue
             in_frontier = 0 if gid in frontier else 1
             remaining = len(group.samples) - group.rewarded_count - group.active_reward_count
@@ -484,7 +542,12 @@ class AsyncRolloutWorker:
             f"active_or_scheduled_samples={active_or_scheduled_samples} "
             f"response_tokens={response_token_summary} "
             f"output_queue_groups={self.training_output_queue.group_count()} active_generation={len(active_generation)} "
-            f"pending_generation_samples={len(pending_generation)} limit_groups={self.max_reward_backlog_groups} "
+            f"pending_generation_samples={len(pending_generation)} "
+            f"inference_active_groups={self.metrics.inference_active_groups} "
+            f"inference_limit_groups={self.max_inference_groups} "
+            f"reward_active_groups={self.metrics.reward_active_groups} "
+            f"reward_limit_groups={self.max_reward_groups} "
+            f"limit_groups={self.max_reward_backlog_groups} "
             f"oldest(gid,gen,scheduled,active,rewarded)={oldest} "
             f"newest(gid,gen,scheduled,active,rewarded)={newest}"
         )
@@ -692,6 +755,8 @@ class FullyAsyncMetrics:
     reward_backlog_samples: int = 0
     reward_dropped_groups: int = 0
     reward_oldest_pending_seconds: float = 0.0
+    inference_active_groups: int = 0
+    reward_active_groups: int = 0
     late_reward_results: int = 0
     generation_failed_groups: int = 0
     reward_failed_groups: int = 0
@@ -702,6 +767,8 @@ class FullyAsyncMetrics:
             "fully_async/reward_backlog_samples": self.reward_backlog_samples,
             "fully_async/reward_dropped_groups": self.reward_dropped_groups,
             "fully_async/reward_oldest_pending_seconds": self.reward_oldest_pending_seconds,
+            "fully_async/inference_active_groups": self.inference_active_groups,
+            "fully_async/reward_active_groups": self.reward_active_groups,
             "fully_async/late_reward_results": self.late_reward_results,
             "fully_async/generation_failed_groups": self.generation_failed_groups,
             "fully_async/reward_failed_groups": self.reward_failed_groups,

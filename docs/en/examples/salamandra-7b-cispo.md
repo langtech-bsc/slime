@@ -33,7 +33,7 @@ pip install -e . --no-deps
 
 Override with `MODEL_DIR` if needed.
 
-**Chat template:** Salamandra CISPO launchers set `SLIME_CHAT_TEMPLATE_PATH` to [rl-training/chat_template.jinja](https://github.com/langtech-bsc/rl-training/blob/main/chat_template.jinja) (Qwen-style ChatML with optional thinking and tool-call blocks). Override with `CHAT_TEMPLATE_PATH=/path/to/template.jinja`. Slime reads this env var in `load_tokenizer()` for dataset formatting, rollout tokenization, and the Megatron actor.
+**Chat template:** Salamandra CISPO launchers set `SLIME_CHAT_TEMPLATE_PATH` to [rl-training/chat_template.jinja](https://github.com/langtech-bsc/rl-training/blob/main/chat_template.jinja) (ChatML with optional leading system message and strict user/assistant alternation). Override with `CHAT_TEMPLATE_PATH=/path/to/template.jinja`. Slime reads this env var in `load_tokenizer()` for dataset formatting, rollout tokenization, and the Megatron actor.
 
 **Sample training data** (repo convention from [quick_start](../get_started/quick_start.md)):
 
@@ -147,6 +147,11 @@ Rollout prompt/response dumps are **always on** (async, under `{SAVE_DIR}/rollou
 ```text
 Actor (4 GPU, Megatron TP=4)  ←── train_async.py
 Rollout (12 GPU, 6 × SGLang TP=2)  ←── fully_async_rollout worker
+Fully-async generation is capped at 8 prompt groups by default
+(`--fully-async-max-inference-groups`, override with `FULLY_ASYNC_MAX_INFERENCE_GROUPS`)
+to limit concurrent long generations that drive weight staleness.
+Reward computation is capped the same way
+(`--fully-async-max-reward-groups`, override with `FULLY_ASYNC_MAX_REWARD_GROUPS`).
 Weight sync every rollout step (`update_weights_interval=1`). Samples with
 `trainer_weight_version - rollout_weight_version > 3` are discarded at train
 time via `--max-rollout-weight-staleness 3` (override with `MAX_ROLLOUT_WEIGHT_STALENESS`).

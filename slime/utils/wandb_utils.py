@@ -180,5 +180,6 @@ def _init_wandb_common():
     wandb.define_metric("eval/step")
     wandb.define_metric("eval/*", step_metric="eval/step")
     wandb.define_metric("perf/*", step_metric="rollout/step")
+    wandb.define_metric("fully_async/*", step_metric="rollout/step")
     wandb.define_metric("queues/*")
     wandb.define_metric("reward_computation/*")

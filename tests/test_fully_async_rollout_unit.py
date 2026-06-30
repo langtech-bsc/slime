@@ -114,6 +114,8 @@ def test_fully_async_generation_refills_while_rewards_are_blocked(monkeypatch):
             generation_concurrency=3,
             reward_concurrency=1,
             max_reward_backlog_groups=99,
+            max_inference_groups=99,
+            max_reward_groups=99,
         )
         task = asyncio.create_task(worker._loop())
         try:
@@ -157,6 +159,8 @@ def test_fully_async_rewards_already_completed_unrewarded_sample(monkeypatch):
             generation_concurrency=1,
             reward_concurrency=1,
             max_reward_backlog_groups=8,
+            max_inference_groups=99,
+            max_reward_groups=99,
         )
         task = asyncio.create_task(worker._loop())
         try:
@@ -203,6 +207,8 @@ def test_fully_async_generation_concurrency_is_counted_per_sample(monkeypatch):
             generation_concurrency=3,
             reward_concurrency=4,
             max_reward_backlog_groups=99,
+            max_inference_groups=99,
+            max_reward_groups=99,
         )
         task = asyncio.create_task(worker._loop())
         try:
@@ -228,6 +234,8 @@ def test_fully_async_drops_newest_inactive_group_and_logs_big_warning(monkeypatc
         generation_concurrency=1,
         reward_concurrency=1,
         max_reward_backlog_groups=1,
+        max_inference_groups=99,
+        max_reward_groups=99,
     )
     now = 1000.0
     groups = {
@@ -264,6 +272,8 @@ def test_fully_async_does_not_drop_group_with_active_reward(monkeypatch):
         generation_concurrency=1,
         reward_concurrency=1,
         max_reward_backlog_groups=1,
+        max_inference_groups=99,
+        max_reward_groups=99,
     )
     groups = {
         1: GroupState(gid=1, samples=[Sample(index=1), Sample(index=2)]),
@@ -296,6 +306,8 @@ def test_fully_async_reward_scheduler_prioritizes_earliest_near_completion(monke
         generation_concurrency=1,
         reward_concurrency=1,
         max_reward_backlog_groups=8,
+        max_inference_groups=99,
+        max_reward_groups=99,
     )
     groups = {
         1: GroupState(gid=1, samples=[Sample(index=10), Sample(index=11), Sample(index=12), Sample(index=13)]),
@@ -339,6 +351,8 @@ def test_fully_async_reward_queue_summary_includes_response_tokens(monkeypatch):
         generation_concurrency=1,
         reward_concurrency=1,
         max_reward_backlog_groups=8,
+        max_inference_groups=99,
+        max_reward_groups=99,
     )
     samples = [Sample(index=1), Sample(index=2), Sample(index=3)]
     for sample, response_length in zip(samples, [10, 20, 90]):
@@ -374,6 +388,8 @@ def test_fully_async_ignores_late_reward_for_dropped_group(monkeypatch, caplog):
         generation_concurrency=1,
         reward_concurrency=1,
         max_reward_backlog_groups=1,
+        max_inference_groups=99,
+        max_reward_groups=99,
     )
 
     async def done():
@@ -389,3 +405,105 @@ def test_fully_async_ignores_late_reward_for_dropped_group(monkeypatch, caplog):
 
     assert worker.metrics.late_reward_results == 1
     assert "ignoring late reward result" in caplog.text
+
+
+@pytest.mark.unit
+def test_fully_async_inference_group_cap_blocks_new_fetch(monkeypatch):
+    from slime.rollout import fully_async_rollout
+
+    monkeypatch.setattr(fully_async_rollout, "GenerateState", _FakeGenerateState)
+
+    max_inference_groups_seen = 0
+
+    async def fake_generate(args, sample, sampling_params, evaluation=False):
+        await asyncio.sleep(0.05)
+        sample.response = "done"
+        sample.response_length = 1
+        sample.tokens = [sample.index]
+        sample.status = Sample.Status.COMPLETED
+        return sample
+
+    async def fake_rm(args, sample):
+        return 1.0
+
+    monkeypatch.setattr(fully_async_rollout, "generate_sample_only", fake_generate)
+    monkeypatch.setattr(fully_async_rollout, "async_rm", fake_rm)
+
+    async def run_case():
+        nonlocal max_inference_groups_seen
+        worker = AsyncRolloutWorker(
+            _args(rollout_batch_size=1),
+            _FiniteDataSource(groups=4, group_size=2),
+            generation_concurrency=4,
+            reward_concurrency=4,
+            max_reward_backlog_groups=99,
+            max_inference_groups=2,
+            max_reward_groups=99,
+        )
+        task = asyncio.create_task(worker._loop())
+        try:
+            await _wait_for(lambda: worker.metrics.inference_active_groups > 0)
+            deadline = asyncio.get_running_loop().time() + 1.0
+            while asyncio.get_running_loop().time() < deadline:
+                max_inference_groups_seen = max(
+                    max_inference_groups_seen,
+                    worker.metrics.inference_active_groups,
+                )
+                await asyncio.sleep(0.01)
+        finally:
+            worker.running = False
+            await task
+
+    asyncio.run(run_case())
+    assert max_inference_groups_seen <= 2
+
+
+@pytest.mark.unit
+def test_fully_async_reward_group_cap_blocks_new_group(monkeypatch):
+    from slime.rollout import fully_async_rollout
+
+    monkeypatch.setattr(fully_async_rollout, "GenerateState", _FakeGenerateState)
+
+    max_reward_groups_seen = 0
+
+    async def fake_generate(args, sample, sampling_params, evaluation=False):
+        sample.response = "done"
+        sample.response_length = 1
+        sample.tokens = [sample.index]
+        sample.status = Sample.Status.COMPLETED
+        return sample
+
+    async def fake_rm(args, sample):
+        await asyncio.sleep(0.05)
+        return 1.0
+
+    monkeypatch.setattr(fully_async_rollout, "generate_sample_only", fake_generate)
+    monkeypatch.setattr(fully_async_rollout, "async_rm", fake_rm)
+
+    async def run_case():
+        nonlocal max_reward_groups_seen
+        worker = AsyncRolloutWorker(
+            _args(rollout_batch_size=1),
+            _FiniteDataSource(groups=4, group_size=2),
+            generation_concurrency=4,
+            reward_concurrency=4,
+            max_reward_backlog_groups=99,
+            max_inference_groups=99,
+            max_reward_groups=2,
+        )
+        task = asyncio.create_task(worker._loop())
+        try:
+            await _wait_for(lambda: worker.metrics.reward_active_groups > 0)
+            deadline = asyncio.get_running_loop().time() + 1.0
+            while asyncio.get_running_loop().time() < deadline:
+                max_reward_groups_seen = max(
+                    max_reward_groups_seen,
+                    worker.metrics.reward_active_groups,
+                )
+                await asyncio.sleep(0.01)
+        finally:
+            worker.running = False
+            await task
+
+    asyncio.run(run_case())
+    assert max_reward_groups_seen <= 2

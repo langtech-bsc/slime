@@ -21,9 +21,8 @@ class QueueDepthSnapshot:
     reward_samples: int
     training_samples: int
 
-    def to_wandb_dict(self, elapsed_s: float) -> dict[str, float | int]:
+    def to_wandb_dict(self) -> dict[str, int]:
         return {
-            "queues/time": elapsed_s,
             "queues/reward_samples": self.reward_samples,
             "queues/training_samples": self.training_samples,
         }

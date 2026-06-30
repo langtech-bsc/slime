@@ -2,8 +2,6 @@
 
 from __future__ import annotations
 
-import time
-
 import wandb
 
 from slime.rollout.queue_metrics import QueueDepthSnapshot
@@ -32,12 +30,12 @@ def update_queues_wandb_config(args) -> None:
     wandb.config.update({"queues/backlog_limit_samples": limit})
 
 
-def log_queue_depth(args, snapshot: QueueDepthSnapshot, elapsed_s: float) -> None:
+def log_queue_depth(args, snapshot: QueueDepthSnapshot, *, step: int) -> None:
     if not getattr(args, "use_wandb", False):
         return
     from slime.utils import logging_utils
 
-    logging_utils.log(args, snapshot.to_wandb_dict(elapsed_s), step_key="queues/time")
+    logging_utils.log(args, snapshot.to_wandb_dict(), step=step)
 
 
 class QueueWandbMonitor:
@@ -45,13 +43,8 @@ class QueueWandbMonitor:
 
     def __init__(self, args) -> None:
         self.args = args
-        self._started_at: float | None = None
-
-    def mark_started(self) -> None:
-        self._started_at = time.monotonic()
+        self._snapshot_index = 0
 
     def maybe_log(self, snapshot: QueueDepthSnapshot) -> None:
-        if self._started_at is None:
-            return
-        elapsed_s = time.monotonic() - self._started_at
-        log_queue_depth(self.args, snapshot, elapsed_s)
+        self._snapshot_index += 1
+        log_queue_depth(self.args, snapshot, step=self._snapshot_index)

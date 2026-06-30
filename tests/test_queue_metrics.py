@@ -33,10 +33,9 @@ def test_compute_queue_depth_counts_reward_and_training_samples():
 @pytest.mark.unit
 def test_queue_depth_snapshot_to_wandb_dict_has_no_limit_key():
     snapshot = QueueDepthSnapshot(reward_samples=4, training_samples=8)
-    payload = snapshot.to_wandb_dict(12.5)
+    payload = snapshot.to_wandb_dict()
 
     assert payload == {
-        "queues/time": 12.5,
         "queues/reward_samples": 4,
         "queues/training_samples": 8,
     }

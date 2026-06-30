@@ -141,7 +141,6 @@ class AsyncRolloutWorker:
 
     def start(self) -> None:
         if self.worker_thread is None or not self.worker_thread.is_alive():
-            self.pipeline_wandb_monitor.mark_started()
             self.worker_thread = threading.Thread(target=self._thread_main, name="fully-async-rollout", daemon=True)
             self.worker_thread.start()
 

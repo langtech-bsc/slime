@@ -21,13 +21,11 @@ def test_merge_rollout_pipeline_wandb_dict():
         oldest_wait_seconds=4.0,
         rm_latency_mean=0.25,
     )
-    payload = merge_rollout_pipeline_wandb_dict(queue, reward, elapsed_s=30.0)
+    payload = merge_rollout_pipeline_wandb_dict(queue, reward)
 
     assert payload == {
-        "queues/time": 30.0,
         "queues/reward_samples": 10,
         "queues/training_samples": 3,
-        "reward_computation/time": 30.0,
         "reward_computation/concurrency_utilization": 0.5,
         "reward_computation/oldest_wait_seconds": 4.0,
         "reward_computation/rm_latency_mean": 0.25,
@@ -40,7 +38,6 @@ def test_merge_rollout_pipeline_wandb_dict():
 def test_rollout_pipeline_wandb_monitor_maybe_log():
     args = SimpleNamespace(use_wandb=True)
     monitor = RolloutPipelineWandbMonitor(args)
-    monitor.mark_started()
 
     queue = QueueDepthSnapshot(reward_samples=1, training_samples=2)
     reward = RewardComputationSnapshot(
@@ -55,7 +52,7 @@ def test_rollout_pipeline_wandb_monitor_maybe_log():
     mock_log.assert_called_once()
     logged_args, logged_payload, kwargs = mock_log.call_args[0][0], mock_log.call_args[0][1], mock_log.call_args[1]
     assert logged_args is args
-    assert kwargs["step_key"] == "queues/time"
+    assert kwargs["step"] == 1
     assert logged_payload["queues/reward_samples"] == 1
     assert logged_payload["reward_computation/concurrency_utilization"] == 1.0
     assert "reward_computation/rm_latency_mean" not in logged_payload

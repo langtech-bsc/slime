@@ -10,10 +10,11 @@ import torch
 import torch.distributed as dist
 from megatron.core import mpu
 from torch_memory_saver import torch_memory_saver
-from transformers import AutoConfig, AutoTokenizer
+from transformers import AutoConfig
 
 from slime.ray.train_actor import TrainRayActor
 from slime.utils import train_dump_utils
+from slime.utils.processing_utils import load_tokenizer
 from slime.utils.data import process_rollout_data
 from slime.utils.distributed_utils import get_gloo_group
 from slime.utils.logging_utils import init_tracking
@@ -74,7 +75,7 @@ class MegatronTrainRayActor(TrainRayActor):
         for i in range(args.num_gpus_per_node):
             if i == dist.get_rank() % args.num_gpus_per_node:
                 self.hf_config = AutoConfig.from_pretrained(args.hf_checkpoint, trust_remote_code=True)
-                self.tokenizer = AutoTokenizer.from_pretrained(self.args.hf_checkpoint, trust_remote_code=True)
+                self.tokenizer = load_tokenizer(self.args.hf_checkpoint, trust_remote_code=True)
             dist.barrier(group=get_gloo_group())
 
         dist.barrier(group=get_gloo_group())

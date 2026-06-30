@@ -2,6 +2,7 @@ import base64
 import io
 import json
 import logging
+import os
 from pathlib import Path
 
 from PIL import Image
@@ -15,8 +16,24 @@ logger = logging.getLogger(__name__)
 DEFAULT_PATCH_SIZE = 14
 
 
+def _apply_chat_template_override(tokenizer: PreTrainedTokenizerBase) -> None:
+    chat_template_path = os.environ.get("SLIME_CHAT_TEMPLATE_PATH")
+    if not chat_template_path:
+        return
+
+    template_path = Path(chat_template_path)
+    if not template_path.is_file():
+        logger.warning("SLIME_CHAT_TEMPLATE_PATH=%s is not a file; using checkpoint template", chat_template_path)
+        return
+
+    tokenizer.chat_template = template_path.read_text(encoding="utf-8")
+    logger.info("Loaded chat template override from %s", template_path)
+
+
 def load_tokenizer(name_or_path: str, **kwargs):
-    return AutoTokenizer.from_pretrained(name_or_path, **kwargs)
+    tokenizer = AutoTokenizer.from_pretrained(name_or_path, **kwargs)
+    _apply_chat_template_override(tokenizer)
+    return tokenizer
 
 
 def build_processor_kwargs(multimodal_inputs: dict | None = None) -> dict:

@@ -33,6 +33,8 @@ pip install -e . --no-deps
 
 Override with `MODEL_DIR` if needed.
 
+**Chat template:** Salamandra CISPO launchers set `SLIME_CHAT_TEMPLATE_PATH` to [rl-training/chat_template.jinja](https://github.com/langtech-bsc/rl-training/blob/main/chat_template.jinja) (Qwen-style ChatML with optional thinking and tool-call blocks). Override with `CHAT_TEMPLATE_PATH=/path/to/template.jinja`. Slime reads this env var in `load_tokenizer()` for dataset formatting, rollout tokenization, and the Megatron actor.
+
 **Sample training data** (repo convention from [quick_start](../get_started/quick_start.md)):
 
 ```bash

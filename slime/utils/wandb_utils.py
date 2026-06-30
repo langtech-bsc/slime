@@ -74,6 +74,9 @@ def init_wandb_primary(args):
     wandb.init(**init_kwargs)
 
     _init_wandb_common()
+    from slime.utils.queues_wandb import update_queues_wandb_config
+
+    update_queues_wandb_config(args)
 
     # Set wandb_run_id in args for easy access throughout the training process
     args.wandb_run_id = wandb.run.id
@@ -162,6 +165,9 @@ def init_wandb_secondary(args, role=None):
     wandb.init(**init_kwargs)
 
     _init_wandb_common()
+    from slime.utils.queues_wandb import update_queues_wandb_config
+
+    update_queues_wandb_config(args)
 
 
 def _init_wandb_common():
@@ -174,3 +180,7 @@ def _init_wandb_common():
     wandb.define_metric("eval/step")
     wandb.define_metric("eval/*", step_metric="eval/step")
     wandb.define_metric("perf/*", step_metric="rollout/step")
+    wandb.define_metric("queues/time")
+    wandb.define_metric("queues/*", step_metric="queues/time")
+    wandb.define_metric("reward_computation/time")
+    wandb.define_metric("reward_computation/*", step_metric="reward_computation/time")

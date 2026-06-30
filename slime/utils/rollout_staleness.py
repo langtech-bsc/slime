@@ -6,11 +6,19 @@ import logging
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
 import torch
 
 from slime.utils import logging_utils
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class RolloutWeightStalenessStats:
+    mean: float | None
+    median: float | None
+    p95: float | None
 
 
 @dataclass(frozen=True)
@@ -100,6 +108,42 @@ def discard_stale_rollout_samples(
     return stats
 
 
+def _loss_mask_is_active(mask: Any) -> bool:
+    if torch.is_tensor(mask):
+        return int(mask.sum().item()) > 0
+    return sum(mask) > 0
+
+
+def rollout_weight_staleness_stats_for_training(
+    rollout_data: dict[str, Any],
+    trainer_weight_version: int,
+) -> RolloutWeightStalenessStats:
+    """Mean/median/p95 trainer-minus-rollout gap for samples kept for training."""
+    weight_versions = rollout_data.get("weight_versions")
+    loss_masks = rollout_data.get("loss_masks")
+    if not weight_versions or not loss_masks:
+        return RolloutWeightStalenessStats(mean=None, median=None, p95=None)
+
+    gaps: list[float] = []
+    for versions, mask in zip(weight_versions, loss_masks, strict=True):
+        if not _loss_mask_is_active(mask):
+            continue
+        gap = rollout_weight_staleness(trainer_weight_version, versions)
+        if gap is None:
+            continue
+        gaps.append(float(gap))
+
+    if not gaps:
+        return RolloutWeightStalenessStats(mean=None, median=None, p95=None)
+
+    arr = np.asarray(gaps, dtype=np.float64)
+    return RolloutWeightStalenessStats(
+        mean=float(arr.mean()),
+        median=float(np.median(arr)),
+        p95=float(np.percentile(arr, 95)),
+    )
+
+
 def log_rollout_weight_staleness_metrics(
     rollout_id: int,
     args: Any,
@@ -107,6 +151,7 @@ def log_rollout_weight_staleness_metrics(
     *,
     trainer_weight_version: int,
     max_staleness: int,
+    rollout_data: dict[str, Any] | None = None,
 ) -> None:
     """Log per-rollout staleness discard counts to stdout and tracking backends."""
     if stats is None:
@@ -132,13 +177,23 @@ def log_rollout_weight_staleness_metrics(
     gather_log_data("rollout_weight_staleness", args, rollout_id, log_dict)
 
     step = compute_rollout_step(args, rollout_id)
+    wandb_payload: dict[str, float | int] = {
+        "train/rollout_weight_staleness_discarded": stats.discarded,
+        "train/rollout_weight_staleness_discard_ratio": stats.discard_ratio,
+        "train/step": step,
+    }
+    if rollout_data is not None:
+        weight_stats = rollout_weight_staleness_stats_for_training(rollout_data, trainer_weight_version)
+        if weight_stats.mean is not None:
+            wandb_payload["train/mean_rollout_weight_staleness"] = weight_stats.mean
+        if weight_stats.median is not None:
+            wandb_payload["train/median_rollout_weight_staleness"] = weight_stats.median
+        if weight_stats.p95 is not None:
+            wandb_payload["train/p95_rollout_weight_staleness"] = weight_stats.p95
+
     logging_utils.log(
         args,
-        {
-            "train/rollout_weight_staleness_discarded": stats.discarded,
-            "train/rollout_weight_staleness_discard_ratio": stats.discard_ratio,
-            "train/step": step,
-        },
+        wandb_payload,
         step_key="train/step",
     )
 

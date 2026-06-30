@@ -118,9 +118,9 @@ def test_fully_async_generation_refills_while_rewards_are_blocked(monkeypatch):
         task = asyncio.create_task(worker._loop())
         try:
             await _wait_for(lambda: len(generated) >= 6)
-            assert worker.output_queue.qsize() == 0
+            assert worker.queue_size() == 0
             reward_gate.set()
-            await _wait_for(lambda: worker.output_queue.qsize() >= 2)
+            await _wait_for(lambda: worker.queue_size() >= 2)
         finally:
             worker.running = False
             await task
@@ -160,7 +160,7 @@ def test_fully_async_rewards_already_completed_unrewarded_sample(monkeypatch):
         )
         task = asyncio.create_task(worker._loop())
         try:
-            await _wait_for(lambda: worker.output_queue.qsize() >= 1)
+            await _wait_for(lambda: worker.queue_size() >= 1)
         finally:
             worker.running = False
             await task
@@ -206,7 +206,7 @@ def test_fully_async_generation_concurrency_is_counted_per_sample(monkeypatch):
         )
         task = asyncio.create_task(worker._loop())
         try:
-            await _wait_for(lambda: worker.output_queue.qsize() >= 1)
+            await _wait_for(lambda: worker.queue_size() >= 1)
         finally:
             worker.running = False
             await task

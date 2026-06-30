@@ -531,6 +531,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     staleness_stats,
                     trainer_weight_version=self.weight_updater.weight_version,
                     max_staleness=self.args.max_rollout_weight_staleness,
+                    rollout_data=rollout_data,
                 )
 
             log_rollout_data(

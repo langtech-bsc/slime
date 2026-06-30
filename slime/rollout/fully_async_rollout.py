@@ -30,16 +30,21 @@ import atexit
 from collections import deque
 from dataclasses import dataclass, field
 import logging
-import queue
 import threading
 import time
 import uuid
 
 from slime.rollout.base_types import RolloutFnTrainOutput
+from slime.rollout.queue_metrics import TrainingOutputQueue, compute_queue_depth
+from slime.rollout.reward_computation_metrics import (
+    RewardComputationTracker,
+    build_reward_computation_snapshot,
+)
 from slime.rollout.rm_hub import async_rm, batched_async_rm
 from slime.rollout.sglang_rollout import GenerateState, generate_sample_only
 from slime.utils.async_utils import run
 from slime.utils.http_utils import get_rollout_num_engines
+from slime.utils.rollout_pipeline_wandb import RolloutPipelineWandbMonitor
 from slime.utils.trace_utils import trace_span
 from slime.utils.types import Sample
 
@@ -125,7 +130,9 @@ class AsyncRolloutWorker:
         self.max_reward_backlog_groups = max_reward_backlog_groups
         self.reward_frontier_groups = reward_frontier_groups or max_reward_backlog_groups
         self.running = True
-        self.output_queue: queue.Queue[tuple[int, list[Sample]]] = queue.Queue(maxsize=1000)
+        self.training_output_queue = TrainingOutputQueue()
+        self.reward_computation_tracker = RewardComputationTracker()
+        self.pipeline_wandb_monitor = RolloutPipelineWandbMonitor(args)
         self.worker_thread: threading.Thread | None = None
         self.state = GenerateState(args)
         self.metrics = FullyAsyncMetrics()
@@ -134,6 +141,7 @@ class AsyncRolloutWorker:
 
     def start(self) -> None:
         if self.worker_thread is None or not self.worker_thread.is_alive():
+            self.pipeline_wandb_monitor.mark_started()
             self.worker_thread = threading.Thread(target=self._thread_main, name="fully-async-rollout", daemon=True)
             self.worker_thread.start()
 
@@ -143,16 +151,10 @@ class AsyncRolloutWorker:
             self.worker_thread.join(timeout=5)
 
     def get_completed_groups(self) -> list[tuple[int, list[Sample]]]:
-        completed: list[tuple[int, list[Sample]]] = []
-        while True:
-            try:
-                completed.append(self.output_queue.get_nowait())
-            except queue.Empty:
-                break
-        return completed
+        return self.training_output_queue.drain()
 
     def queue_size(self) -> int:
-        return self.output_queue.qsize()
+        return self.training_output_queue.group_count()
 
     def collect_metrics(self) -> dict[str, float | int]:
         return self.metrics.snapshot()
@@ -195,6 +197,21 @@ class AsyncRolloutWorker:
                             active_reward=active_reward,
                             active_generation=active_generation,
                             pending_generation=pending_generation,
+                        ),
+                    )
+                    self.pipeline_wandb_monitor.maybe_log(
+                        compute_queue_depth(
+                            groups=groups,
+                            pending_generation=pending_generation,
+                            active_generation=active_generation,
+                            reward_backlog_samples=self.metrics.reward_backlog_samples,
+                            training_queue_samples=self.training_output_queue.sample_count,
+                        ),
+                        build_reward_computation_snapshot(
+                            active_reward=active_reward,
+                            reward_concurrency=self.reward_concurrency,
+                            oldest_wait_seconds=self.metrics.reward_oldest_pending_seconds,
+                            tracker=self.reward_computation_tracker,
                         ),
                     )
                     last_reward_queue_log = now
@@ -375,20 +392,21 @@ class AsyncRolloutWorker:
         return item
 
     async def _reward_sample_or_group(self, sample_or_group: Sample | list[Sample]) -> Sample | list[Sample]:
-        if isinstance(sample_or_group, list):
-            samples_need_reward = [sample for sample in sample_or_group if sample.reward is None]
-            if samples_need_reward:
-                with trace_span(samples_need_reward, "reward_model"):
-                    rewards = await batched_async_rm(self.args, samples_need_reward)
-                for sample, reward in zip(samples_need_reward, rewards, strict=False):
-                    sample.reward = reward
-            return sample_or_group
+        async with self.reward_computation_tracker.measure_rm(sample_or_group):
+            if isinstance(sample_or_group, list):
+                samples_need_reward = [sample for sample in sample_or_group if sample.reward is None]
+                if samples_need_reward:
+                    with trace_span(samples_need_reward, "reward_model"):
+                        rewards = await batched_async_rm(self.args, samples_need_reward)
+                    for sample, reward in zip(samples_need_reward, rewards, strict=False):
+                        sample.reward = reward
+                return sample_or_group
 
-        sample = sample_or_group
-        if sample.reward is None:
-            with trace_span(sample, "reward_model"):
-                sample.reward = await async_rm(self.args, sample)
-        return sample
+            sample = sample_or_group
+            if sample.reward is None:
+                with trace_span(sample, "reward_model"):
+                    sample.reward = await async_rm(self.args, sample)
+            return sample
 
     def _publish_ready_groups(self, groups: dict[int, "GroupState"]) -> None:
         ready_gids = [
@@ -402,7 +420,7 @@ class AsyncRolloutWorker:
             if any(item is None for item in result):
                 logger.error("fully-async: refusing to publish incomplete group gid=%s", gid)
                 continue
-            self.output_queue.put((gid, result))
+            self.training_output_queue.put(gid, result)
 
     def _refresh_backlog_metrics(self, groups: dict[int, "GroupState"]) -> None:
         backlogged = [group for group in groups.values() if group.is_waiting_for_reward]
@@ -466,7 +484,7 @@ class AsyncRolloutWorker:
             f"active_reward_samples={active_reward_samples} unscheduled_samples={unscheduled_samples} "
             f"active_or_scheduled_samples={active_or_scheduled_samples} "
             f"response_tokens={response_token_summary} "
-            f"output_queue_groups={self.output_queue.qsize()} active_generation={len(active_generation)} "
+            f"output_queue_groups={self.training_output_queue.group_count()} active_generation={len(active_generation)} "
             f"pending_generation_samples={len(pending_generation)} limit_groups={self.max_reward_backlog_groups} "
             f"oldest(gid,gen,scheduled,active,rewarded)={oldest} "
             f"newest(gid,gen,scheduled,active,rewarded)={newest}"

@@ -1,12 +1,15 @@
 """Tests for rollout weight-version staleness filtering."""
 
 import torch
+import pytest
 
 from slime.utils.rollout_staleness import (
     RolloutStalenessStats,
+    RolloutWeightStalenessStats,
     discard_stale_rollout_samples,
     min_rollout_weight_version,
     rollout_weight_staleness,
+    rollout_weight_staleness_stats_for_training,
 )
 
 
@@ -34,3 +37,43 @@ def test_discard_stale_rollout_samples_zeros_masks_and_recomputes_rollout_totals
     assert rollout_data["loss_masks"][0].sum().item() == 0
     assert rollout_data["loss_masks"][1].sum().item() == 2
     assert rollout_data["rollout_mask_sums"].tolist() == [2, 2]
+
+
+def test_rollout_weight_staleness_stats_for_training_mean_median_p95():
+    rollout_data = {
+        "weight_versions": [["7"], ["8"], ["9"], ["10"]],
+        "loss_masks": [
+            torch.ones(2, dtype=torch.int32),
+            torch.ones(2, dtype=torch.int32),
+            torch.zeros(2, dtype=torch.int32),
+            torch.ones(2, dtype=torch.int32),
+        ],
+    }
+
+    stats = rollout_weight_staleness_stats_for_training(rollout_data, trainer_weight_version=10)
+
+    assert stats.mean == pytest.approx(5 / 3)
+    assert stats.median == pytest.approx(2.0)
+    assert stats.p95 == pytest.approx(2.9)
+
+
+def test_rollout_weight_staleness_stats_for_training_skips_unknown_versions():
+    rollout_data = {
+        "weight_versions": [["bad"], ["9"]],
+        "loss_masks": [torch.ones(1, dtype=torch.int32), torch.ones(1, dtype=torch.int32)],
+    }
+
+    stats = rollout_weight_staleness_stats_for_training(rollout_data, trainer_weight_version=10)
+
+    assert stats == RolloutWeightStalenessStats(mean=1.0, median=1.0, p95=1.0)
+
+
+def test_rollout_weight_staleness_stats_for_training_empty_when_no_kept_samples():
+    rollout_data = {
+        "weight_versions": [["7"]],
+        "loss_masks": [torch.zeros(1, dtype=torch.int32)],
+    }
+
+    stats = rollout_weight_staleness_stats_for_training(rollout_data, trainer_weight_version=10)
+
+    assert stats == RolloutWeightStalenessStats(mean=None, median=None, p95=None)

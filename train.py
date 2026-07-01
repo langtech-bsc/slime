@@ -64,7 +64,15 @@ def train(args):
         if args.eval_interval is not None and rollout_id == 0 and not args.skip_eval_before_train:
             ray.get(rollout_manager.eval.remote(rollout_id))
 
-        rollout_data_ref = ray.get(rollout_manager.generate.remote(rollout_id))
+        rollout_payload = ray.get(rollout_manager.collect_rollout_samples.remote(rollout_id))
+        trainer_weight_version = actor_model.get_weight_version()
+        rollout_data_ref = ray.get(
+            rollout_manager.prepare_train_data.remote(
+                rollout_id,
+                rollout_payload,
+                trainer_weight_version=trainer_weight_version,
+            )
+        )
 
         if args.offload_rollout:
             ray.get(rollout_manager.offload.remote())

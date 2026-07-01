@@ -162,6 +162,15 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
     ), f"Sample status is {sample.status}"
 
     prompt_ids = _prepare_prompt_ids(sample, state.tokenizer, state.processor)
+    max_new_tokens = int(sampling_params["max_new_tokens"])
+    rollout_max_response_len = getattr(args, "rollout_max_response_len", None)
+    rollout_max_context_len = getattr(args, "rollout_max_context_len", None)
+    if rollout_max_response_len is not None:
+        max_new_tokens = min(max_new_tokens, max(0, rollout_max_response_len - sample.response_length))
+    if rollout_max_context_len is not None:
+        max_new_tokens = min(max_new_tokens, max(0, rollout_max_context_len - len(prompt_ids)))
+    sampling_params = sampling_params.copy()
+    sampling_params["max_new_tokens"] = max_new_tokens
 
     assert (
         sampling_params["max_new_tokens"] >= 0
@@ -215,6 +224,17 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
         meta_info=output["meta_info"],
         text=output["text"],
     )
+
+    if rollout_max_response_len is not None and sample.response_length > rollout_max_response_len:
+        raise ValueError(
+            f"SGLang generated {sample.response_length} response tokens, exceeding "
+            f"rollout_max_response_len={rollout_max_response_len} for sample index={sample.index}."
+        )
+    if rollout_max_context_len is not None and len(sample.tokens) > rollout_max_context_len:
+        raise ValueError(
+            f"SGLang produced {len(sample.tokens)} total tokens, exceeding "
+            f"rollout_max_context_len={rollout_max_context_len} for sample index={sample.index}."
+        )
 
     return sample
 

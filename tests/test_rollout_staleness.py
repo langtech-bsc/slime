@@ -8,6 +8,7 @@ from slime.utils.rollout_staleness import (
     RolloutWeightStalenessStats,
     discard_stale_rollout_samples,
     min_rollout_weight_version,
+    raise_on_stale_rollout_samples,
     rollout_weight_staleness,
     rollout_weight_staleness_stats_for_training,
 )
@@ -77,3 +78,13 @@ def test_rollout_weight_staleness_stats_for_training_empty_when_no_kept_samples(
     stats = rollout_weight_staleness_stats_for_training(rollout_data, trainer_weight_version=10)
 
     assert stats == RolloutWeightStalenessStats(mean=None, median=None, p95=None)
+
+
+def test_raise_on_stale_rollout_samples_rejects_stale_in_actor_guard():
+    rollout_data = {
+        "weight_versions": [["4"], ["8"]],
+        "loss_masks": [torch.ones(3, dtype=torch.int32), torch.ones(2, dtype=torch.int32)],
+    }
+
+    with pytest.raises(ValueError, match="Stale rollout samples reached actor training"):
+        raise_on_stale_rollout_samples(rollout_data, trainer_weight_version=10, max_staleness=3)

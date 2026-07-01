@@ -44,7 +44,10 @@ def finish_tracking(args):
 # TODO further refactor, e.g. put TensorBoard init to the "init" part
 def log(args, metrics, step_key: str | None = None, *, step: int | float | None = None):
     if args.use_wandb:
-        wandb.log(metrics)
+        if step_key is not None and step_key in metrics:
+            wandb.log(metrics, step=int(metrics[step_key]))
+        else:
+            wandb.log(metrics)
 
     if args.use_tensorboard:
         if step_key is not None and step_key in metrics:

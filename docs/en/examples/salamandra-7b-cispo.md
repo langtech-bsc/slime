@@ -153,8 +153,9 @@ to limit concurrent long generations that drive weight staleness.
 Reward computation is capped the same way
 (`--fully-async-max-reward-groups`, override with `FULLY_ASYNC_MAX_REWARD_GROUPS`).
 Weight sync every rollout step (`update_weights_interval=1`). Samples with
-`trainer_weight_version - rollout_weight_version > 3` are discarded at train
-time via `--max-rollout-weight-staleness 3` (override with `MAX_ROLLOUT_WEIGHT_STALENESS`).
-Logged metrics: `rollout_weight_staleness/discarded`, `rollout_weight_staleness/discard_ratio`,
-`train/rollout_weight_staleness_discarded`.
+`trainer_weight_version - rollout_weight_version > 3` are dropped before training
+via `--max-rollout-weight-staleness 3` (override with `MAX_ROLLOUT_WEIGHT_STALENESS`).
+Logged metrics: `rollout_filter/dropped_stale_samples` (at `rollout/step`),
+`train/rollout_filter_dropped_stale_samples` and `train/mean_rollout_weight_staleness`
+(at `train/step`).
 ```

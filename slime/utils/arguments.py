@@ -571,6 +571,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--rollout-group-min-survival-rate",
+                type=float,
+                default=0.8,
+                help=(
+                    "Minimum fraction of samples in a prompt/fanout group that must remain after "
+                    "pre-training stale and length filtering. Groups below this threshold are dropped."
+                ),
+            )
+            parser.add_argument(
                 "--keep-old-actor",
                 action="store_true",
                 help="Whether to keep the rollout model on training process",

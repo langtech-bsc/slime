@@ -26,9 +26,7 @@ Invariants guaranteed by :func:`build_dp_schedule` (asserted by the tests):
   - every DP rank runs the **same** ``num_microbatches`` per training step
     (required for PP sync);
   - every mbs (dynamic path without ``balance_by_flops``) holds
-    ``<= max_tokens_per_gpu * cp_size`` tokens, with one exception — an
-    individual sample larger than that cap lands alone in its own mbs (and
-    that mbs is the only one allowed to exceed the cap);
+    ``<= max_tokens_per_gpu * cp_size`` tokens;
   - the union of per-rank sample indices equals the set of samples kept
     after trimming trailing rollouts (every kept sample placed exactly
     once);
@@ -77,6 +75,36 @@ def _pack_step_into_mbs(
     assert micro_batch_size is not None
     n = len(step_lengths)
     return [list(range(i, min(i + micro_batch_size, n))) for i in range(0, n, micro_batch_size)]
+
+
+def compute_pack_fullness_stats(
+    total_lengths: list[int],
+    micro_batch_indices: list[list[int]],
+    capacity: int | float,
+) -> dict[str, float]:
+    """Return mean/max/min pack utilization for a local micro-batch schedule.
+
+    ``micro_batch_indices`` indexes into ``total_lengths`` for the local DP
+    partition.
+    """
+    if capacity <= 0:
+        raise ValueError(f"capacity must be positive, got {capacity}")
+    if not micro_batch_indices:
+        return {
+            "mean": 0.0,
+            "max": 0.0,
+            "min": 0.0,
+        }
+
+    fullness = [
+        sum(total_lengths[i] for i in micro_batch) / capacity
+        for micro_batch in micro_batch_indices
+    ]
+    return {
+        "mean": sum(fullness) / len(fullness),
+        "max": max(fullness),
+        "min": min(fullness),
+    }
 
 
 def build_dp_schedule(

@@ -1,6 +1,7 @@
 import dataclasses
 import itertools
 import logging
+import math
 import multiprocessing
 import os
 import random
@@ -26,6 +27,7 @@ from slime.utils.logging_utils import configure_logger, init_tracking
 from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step, compute_statistics, dict_add_prefix
 from slime.utils.misc import Box, group_by, load_function
 from slime.utils.rollout_dump_utils import AsyncRolloutDumper, RolloutDumpJob, load_rollout_dump, resolve_rollout_dump_load_path
+from slime.utils.rollout_staleness import rollout_weight_staleness
 from slime.utils.types import Sample
 
 from ..utils.metric_utils import has_repetition
@@ -547,7 +549,7 @@ class RolloutManager:
         assert self.args.rollout_global_dataset
         return len(self.data_source) // self.args.rollout_batch_size
 
-    def generate(self, rollout_id):
+    def collect_rollout_samples(self, rollout_id):
         start_time = time.time()
         self.rollout_id = rollout_id
         self.health_monitoring_resume()
@@ -555,12 +557,39 @@ class RolloutManager:
             self._try_ci_fault_injection()
         data, metrics = self._get_rollout_data(rollout_id=rollout_id)
         self._save_debug_rollout_data(data, rollout_id=rollout_id, evaluation=False)
-        _log_rollout_data(rollout_id, self.args, data, metrics, time.time() - start_time)
+        rollout_time = time.time() - start_time
+        _log_rollout_data(rollout_id, self.args, data, metrics, rollout_time)
+        return {"data": data, "metrics": metrics, "rollout_time": rollout_time}
+
+    def prepare_train_data(self, rollout_id, rollout_payload, trainer_weight_version=None):
         if self.args.debug_rollout_only:
             # if debug rollout only, we don't convert samples to train data and directly return
             return
-        data = self._convert_samples_to_train_data(data)
-        return self._split_train_data_by_dp(data)
+        data = rollout_payload["data"] if isinstance(rollout_payload, dict) else rollout_payload
+        data, filter_metrics = _filter_rollout_groups_for_training(
+            self.args,
+            data,
+            trainer_weight_version=trainer_weight_version,
+            train_parallel_config=self.train_parallel_config,
+        )
+        _log_rollout_filter_data(rollout_id, self.args, filter_metrics)
+        data = list(itertools.chain.from_iterable(data))
+        train_data = self._convert_samples_to_train_data(data)
+        train_data["rollout_filter_metrics"] = filter_metrics
+        return self._split_train_data_by_dp(train_data)
+
+    def generate(self, rollout_id, trainer_weight_version=None):
+        if self.args.max_rollout_weight_staleness is not None and trainer_weight_version is None:
+            raise ValueError(
+                "generate() requires trainer_weight_version when --max-rollout-weight-staleness is set; "
+                "call collect_rollout_samples() and prepare_train_data(..., trainer_weight_version=...) instead."
+            )
+        rollout_payload = self.collect_rollout_samples(rollout_id)
+        return self.prepare_train_data(
+            rollout_id,
+            rollout_payload,
+            trainer_weight_version=trainer_weight_version,
+        )
 
     def eval(self, rollout_id):
         if self.args.debug_train_only:
@@ -893,6 +922,8 @@ class RolloutManager:
             rollout_data["global_batch_sizes"] = global_batch_sizes
             rollout_data["num_microbatches"] = num_microbatches
             rollout_data["micro_batch_indices"] = micro_batch_indices[r]
+            if "rollout_filter_metrics" in data:
+                rollout_data["rollout_filter_metrics"] = data["rollout_filter_metrics"]
             _tensorize_rollout_data_for_training(rollout_data)
             transport = getattr(self.args, "rollout_data_transport", "object-store")
             if transport == "nixl":
@@ -934,6 +965,165 @@ def _validate_rollout_id_annotated(node, depth=0):
         return
     for item in node:
         _validate_rollout_id_annotated(item, depth + 1)
+
+
+def _group_key(sample: Sample, fallback: int) -> int:
+    if sample.group_index is not None:
+        return int(sample.group_index)
+    if sample.rollout_id is not None:
+        return int(sample.rollout_id)
+    if sample.index is not None:
+        return int(sample.index)
+    return fallback
+
+
+def _as_rollout_groups(data: list[Sample] | list[list[Sample]]) -> list[list[Sample]]:
+    if not data:
+        return []
+    if isinstance(data[0], Sample):
+        groups: dict[int, list[Sample]] = {}
+        for pos, sample in enumerate(data):
+            groups.setdefault(_group_key(sample, pos), []).append(sample)
+        return list(groups.values())
+    groups = []
+    for group in data:
+        if group and isinstance(group[0], list):
+            groups.append(list(itertools.chain.from_iterable(group)))
+        else:
+            groups.append(group)
+    return groups
+
+
+def _sample_length_drop_reason(args, sample: Sample, train_parallel_config: dict | None) -> str | None:
+    total_length = len(sample.tokens)
+    if args.rollout_max_response_len is not None and sample.response_length > args.rollout_max_response_len:
+        return f"response_length>{args.rollout_max_response_len}"
+    if args.rollout_max_context_len is not None and total_length > args.rollout_max_context_len:
+        return f"total_length>{args.rollout_max_context_len}"
+    if args.use_dynamic_batch_size and args.max_tokens_per_gpu is not None:
+        cp_size = 1 if train_parallel_config is None else train_parallel_config.get("cp_size", 1)
+        train_capacity = args.max_tokens_per_gpu * cp_size
+        if total_length > train_capacity:
+            return f"total_length>{train_capacity}"
+    return None
+
+
+def _sample_stale_drop_reason(args, sample: Sample, trainer_weight_version: int | None) -> str | None:
+    if trainer_weight_version is None or args.max_rollout_weight_staleness is None:
+        return None
+    staleness = rollout_weight_staleness(trainer_weight_version, sample.weight_versions)
+    if staleness is None or staleness <= args.max_rollout_weight_staleness:
+        return None
+    return f"staleness>{args.max_rollout_weight_staleness}"
+
+
+def _filter_rollout_groups_for_training(
+    args,
+    data: list[Sample] | list[list[Sample]],
+    *,
+    trainer_weight_version: int | None,
+    train_parallel_config: dict | None,
+) -> tuple[list[list[Sample]], dict[str, float | int]]:
+    groups = _as_rollout_groups(data)
+    survival_rate = float(getattr(args, "rollout_group_min_survival_rate", 0.8))
+    if survival_rate < 0 or survival_rate > 1:
+        raise ValueError(f"rollout_group_min_survival_rate must be in [0, 1], got {survival_rate}")
+
+    kept_groups: list[list[Sample]] = []
+    dropped_stale_samples = 0
+    dropped_length_samples = 0
+    dropped_survival_groups = 0
+    dropped_survival_samples = 0
+    original_samples = 0
+    kept_samples = 0
+
+    for group in groups:
+        original_group_size = len(group)
+        original_samples += original_group_size
+        survivors: list[Sample] = []
+        for sample in group:
+            length_reason = _sample_length_drop_reason(args, sample, train_parallel_config)
+            if length_reason is not None:
+                dropped_length_samples += 1
+                logger.warning(
+                    "Dropping rollout sample before training due to %s: index=%s rollout_id=%s "
+                    "group_index=%s response_length=%s total_length=%s weight_versions=%s",
+                    length_reason,
+                    sample.index,
+                    sample.rollout_id,
+                    sample.group_index,
+                    sample.response_length,
+                    len(sample.tokens),
+                    sample.weight_versions,
+                )
+                continue
+
+            stale_reason = _sample_stale_drop_reason(args, sample, trainer_weight_version)
+            if stale_reason is not None:
+                dropped_stale_samples += 1
+                logger.info(
+                    "Dropping stale rollout sample before training due to %s: index=%s rollout_id=%s "
+                    "group_index=%s trainer_weight_version=%s sample_weight_versions=%s",
+                    stale_reason,
+                    sample.index,
+                    sample.rollout_id,
+                    sample.group_index,
+                    trainer_weight_version,
+                    sample.weight_versions,
+                )
+                continue
+
+            survivors.append(sample)
+
+        min_survivors = math.ceil(survival_rate * original_group_size)
+        if len(survivors) < min_survivors:
+            dropped_survival_groups += 1
+            dropped_survival_samples += len(survivors)
+            logger.warning(
+                "Dropping rollout group before training because survival %d/%d < %d "
+                "(rate=%.3f). group_index=%s rollout_ids=%s sample_indices=%s",
+                len(survivors),
+                original_group_size,
+                min_survivors,
+                survival_rate,
+                group[0].group_index if group else None,
+                [sample.rollout_id for sample in group],
+                [sample.index for sample in group],
+            )
+            continue
+
+        kept_samples += len(survivors)
+        kept_groups.append(survivors)
+
+    metrics = {
+        "original_groups": len(groups),
+        "kept_groups": len(kept_groups),
+        "dropped_survival_groups": dropped_survival_groups,
+        "original_samples": original_samples,
+        "kept_samples": kept_samples,
+        "dropped_stale_samples": dropped_stale_samples,
+        "dropped_length_samples": dropped_length_samples,
+        "dropped_survival_samples": dropped_survival_samples,
+    }
+    metrics["sample_keep_ratio"] = kept_samples / original_samples if original_samples else 0.0
+    metrics["group_keep_ratio"] = len(kept_groups) / len(groups) if groups else 0.0
+
+    if not kept_groups:
+        raise ValueError(
+            "No rollout groups survived pre-training filtering; "
+            f"metrics={metrics}, trainer_weight_version={trainer_weight_version}"
+        )
+
+    return kept_groups, metrics
+
+
+def _log_rollout_filter_data(rollout_id: int, args, metrics: dict[str, float | int]) -> None:
+    if not metrics:
+        return
+    logger.info("rollout_filter %s: %s", rollout_id, metrics)
+    payload = {f"rollout_filter/{key}": value for key, value in metrics.items()}
+    payload["rollout/step"] = compute_rollout_step(args, rollout_id)
+    logging_utils.log(args, payload, step_key="rollout/step")
 
 
 def _allocate_rollout_engine_addr_and_ports_normal(

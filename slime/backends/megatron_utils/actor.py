@@ -21,10 +21,7 @@ from slime.utils.logging_utils import init_tracking
 from slime.utils.memory_utils import clear_memory, print_memory
 from slime.utils.misc import Box
 from slime.utils.reloadable_process_group import destroy_process_groups, monkey_patch_torch_dist, reload_process_groups
-from slime.utils.rollout_staleness import (
-    discard_stale_rollout_samples,
-    log_rollout_weight_staleness_metrics,
-)
+from slime.utils.rollout_staleness import log_rollout_weight_staleness_metrics, raise_on_stale_rollout_samples
 from slime.utils.routing_replay import RoutingReplay
 from slime.utils.timer import Timer, inverse_timer, timer, with_defer
 from slime.utils.types import RolloutBatch
@@ -232,12 +229,13 @@ class MegatronTrainRayActor(TrainRayActor):
             mpu.get_data_parallel_world_size(with_context_parallel=False),
         )
         if self.args.max_rollout_weight_staleness is not None and self.role == "actor":
-            staleness_stats = discard_stale_rollout_samples(
+            staleness_stats = raise_on_stale_rollout_samples(
                 rollout_data,
                 trainer_weight_version=self.weight_updater.weight_version,
                 max_staleness=self.args.max_rollout_weight_staleness,
             )
             rollout_data["rollout_weight_staleness_stats"] = staleness_stats
+        self._validate_rollout_lengths_before_gpu(rollout_data)
         # TODO: this is ugly, move to somewhere else?
         # move tokens to GPU in advance
         device = torch.cuda.current_device()
@@ -287,6 +285,40 @@ class MegatronTrainRayActor(TrainRayActor):
                 )
             ]
         return rollout_data
+
+    def _validate_rollout_lengths_before_gpu(self, rollout_data: RolloutBatch) -> None:
+        cp_size = mpu.get_context_parallel_world_size()
+        train_capacity = None
+        if self.args.use_dynamic_batch_size and self.args.max_tokens_per_gpu is not None:
+            train_capacity = self.args.max_tokens_per_gpu * cp_size
+
+        for i, (tokens, response_length) in enumerate(
+            zip(rollout_data["tokens"], rollout_data["response_lengths"], strict=True)
+        ):
+            total_length = len(tokens)
+            sample_index = rollout_data.get("sample_indices", [None] * len(rollout_data["tokens"]))[i]
+            rollout_id = rollout_data.get("rollout_ids", [None] * len(rollout_data["tokens"]))[i]
+            if self.args.rollout_max_response_len is not None and response_length > self.args.rollout_max_response_len:
+                raise ValueError(
+                    f"rollout sample exceeds response cap before GPU transfer: sample_index={sample_index}, "
+                    f"rollout_id={rollout_id}, response_length={response_length}, "
+                    f"rollout_max_response_len={self.args.rollout_max_response_len}"
+                )
+            if self.args.rollout_max_context_len is not None and total_length > self.args.rollout_max_context_len:
+                raise ValueError(
+                    f"rollout sample exceeds context cap before GPU transfer: sample_index={sample_index}, "
+                    f"rollout_id={rollout_id}, total_length={total_length}, "
+                    f"rollout_max_context_len={self.args.rollout_max_context_len}"
+                )
+            if train_capacity is not None and total_length > train_capacity:
+                raise ValueError(
+                    f"rollout sample exceeds train token capacity before GPU transfer: sample_index={sample_index}, "
+                    f"rollout_id={rollout_id}, total_length={total_length}, train_capacity={train_capacity}, "
+                    f"max_tokens_per_gpu={self.args.max_tokens_per_gpu}, cp_size={cp_size}"
+                )
+
+    def get_weight_version(self) -> int:
+        return int(self.weight_updater.weight_version)
 
     def _switch_model(self, target_tag: str) -> None:
         if target_tag not in self.weights_backuper.backup_tags:
@@ -525,6 +557,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 self.rollout_data_postprocess(self.args, rollout_id, rollout_data)
 
             staleness_stats = rollout_data.pop("rollout_weight_staleness_stats", None)
+            filter_metrics = rollout_data.pop("rollout_filter_metrics", None)
             if staleness_stats is not None and self.args.max_rollout_weight_staleness is not None:
                 log_rollout_weight_staleness_metrics(
                     rollout_id,
@@ -532,7 +565,9 @@ class MegatronTrainRayActor(TrainRayActor):
                     staleness_stats,
                     trainer_weight_version=self.weight_updater.weight_version,
                     max_staleness=self.args.max_rollout_weight_staleness,
+                    num_steps_per_rollout=len(num_microbatches),
                     rollout_data=rollout_data,
+                    filter_metrics=filter_metrics,
                 )
 
             log_rollout_data(

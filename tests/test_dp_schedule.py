@@ -8,7 +8,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from slime.utils.dp_schedule import build_dp_schedule
+from slime.utils.dp_schedule import build_dp_schedule, compute_pack_fullness_stats
 
 
 NUM_GPUS = 0
@@ -84,13 +84,50 @@ def assert_invariants(
     if max_per_bin is None:
         return
 
-    # Every mbs <= max_per_bin tokens, EXCEPT a singleton bin holding an oversized sample.
+    # Every mbs <= max_per_bin tokens.
     for r in range(dp_size):
         partition = partitions[r]
         for mbs in micro_batch_indices[r]:
             bin_total = sum(total_lengths[partition[i]] for i in mbs)
-            if bin_total > max_per_bin:
-                assert len(mbs) == 1, f"rank {r}: mbs sum {bin_total} > {max_per_bin} but contains {len(mbs)} samples"
+            assert bin_total <= max_per_bin
+
+
+@pytest.mark.unit
+def test_compute_pack_fullness_stats():
+    total_lengths = [4, 6, 8, 2]
+    micro_batch_indices = [[0, 1], [2], [3]]
+
+    stats = compute_pack_fullness_stats(total_lengths, micro_batch_indices, capacity=10)
+
+    assert stats == pytest.approx(
+        {
+            "mean": (1.0 + 0.8 + 0.2) / 3,
+            "max": 1.0,
+            "min": 0.2,
+        }
+    )
+
+
+@pytest.mark.unit
+def test_compute_pack_fullness_stats_uses_cp_capacity():
+    total_lengths = [8, 8, 4]
+    micro_batch_indices = [[0, 1], [2]]
+
+    stats = compute_pack_fullness_stats(total_lengths, micro_batch_indices, capacity=10 * 2)
+
+    assert stats == pytest.approx(
+        {
+            "mean": (0.8 + 0.2) / 2,
+            "max": 0.8,
+            "min": 0.2,
+        }
+    )
+
+
+@pytest.mark.unit
+def test_compute_pack_fullness_stats_rejects_non_positive_capacity():
+    with pytest.raises(ValueError, match="capacity"):
+        compute_pack_fullness_stats([1], [[0]], capacity=0)
 
 
 @pytest.mark.unit
@@ -191,37 +228,15 @@ def test_dynamic_uniform():
 
 
 @pytest.mark.unit
-def test_dynamic_oversized_sample_lands_alone():
-    """A sample larger than max_per_bin must end up alone in its mbs."""
+def test_dynamic_oversized_sample_is_rejected():
+    """Oversized samples must be filtered before scheduling."""
     total_lengths = [15, 3, 3, 3, 3, 3, 3, 3]
     rollout_indices = list(range(8))
     args = make_args(use_dynamic_batch_size=True, max_tokens_per_gpu=10)
     tp = make_tp(dp_size=2)
 
-    partitions, mbi, nmb, gbs_per_step = build_dp_schedule(
-        args, tp, total_lengths, global_batch_size=8, rollout_indices=rollout_indices
-    )
-
-    assert_invariants(
-        partitions,
-        mbi,
-        nmb,
-        dp_size=2,
-        expected_global_sample_indices=range(8),
-        total_lengths=total_lengths,
-        max_per_bin=10,
-    )
-    oversize_idx = total_lengths.index(15)
-    found = False
-    for r in range(2):
-        if oversize_idx not in partitions[r]:
-            continue
-        local = partitions[r].index(oversize_idx)
-        for mbs in mbi[r]:
-            if local in mbs:
-                assert mbs == [local], f"oversized sample shares an mbs: {mbs}"
-                found = True
-    assert found
+    with pytest.raises(ValueError, match="exceeds max_tokens_per_bin"):
+        build_dp_schedule(args, tp, total_lengths, global_batch_size=8, rollout_indices=rollout_indices)
 
 
 @pytest.mark.unit

@@ -283,5 +283,29 @@ def test_spec_info_only_updated_when_speculative_enabled():
     assert with_spec.spec_info.spec_draft_token_num == 10
 
 
+@pytest.mark.unit
+def test_reset_generation_state_preserves_prompt_tokens_and_clears_response_state():
+    sample = Sample(index=1, prompt="prompt")
+    sample.tokens = [10, 11, 12, 13, 14]
+    sample.response = "abc"
+    sample.response_length = 3
+    sample.reward = 1.0
+    sample.loss_mask = [1, 1, 1]
+    sample.weight_versions = ["1", "2"]
+    sample.rollout_log_probs = [-1.0, -1.0, -1.0]
+    sample.status = Sample.Status.ABORTED
+
+    sample.reset_generation_state()
+
+    assert sample.tokens == [10, 11]
+    assert sample.response == ""
+    assert sample.response_length == 0
+    assert sample.reward is None
+    assert sample.loss_mask is None
+    assert sample.weight_versions == []
+    assert sample.rollout_log_probs is None
+    assert sample.status == Sample.Status.PENDING
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))

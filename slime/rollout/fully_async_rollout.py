@@ -358,11 +358,26 @@ class AsyncRolloutWorker:
         group.generated_count += 1
         if _contains_aborted(generated):
             group.dropped = True
+            for sample in group.samples:
+                sample.reset_generation_state()
             try:
                 self.data_buffer.add_samples([group.samples])
             except Exception:  # noqa: BLE001
                 logger.exception("fully-async: failed to requeue aborted group")
             groups.pop(gid, None)
+            return
+
+        invalid_reason = _invalid_generated_unit_reason(self.args, generated)
+        if invalid_reason is not None:
+            group.dropped = True
+            groups.pop(gid, None)
+            self.metrics.generation_invalid_groups += 1
+            logger.error(
+                "fully-async: dropping generated group gid=%s sample_idx=%s before reward: %s",
+                gid,
+                sample_idx,
+                invalid_reason,
+            )
             return
 
         if self.args.group_rm:
@@ -759,6 +774,7 @@ class FullyAsyncMetrics:
     reward_active_groups: int = 0
     late_reward_results: int = 0
     generation_failed_groups: int = 0
+    generation_invalid_groups: int = 0
     reward_failed_groups: int = 0
 
     def snapshot(self) -> dict[str, float | int]:
@@ -771,6 +787,7 @@ class FullyAsyncMetrics:
             "fully_async/reward_active_groups": self.reward_active_groups,
             "fully_async/late_reward_results": self.late_reward_results,
             "fully_async/generation_failed_groups": self.generation_failed_groups,
+            "fully_async/generation_invalid_groups": self.generation_invalid_groups,
             "fully_async/reward_failed_groups": self.reward_failed_groups,
         }
 
@@ -779,3 +796,27 @@ def _contains_aborted(sample_or_group: Sample | list[Sample]) -> bool:
     if isinstance(sample_or_group, list):
         return any(getattr(sample, "status", None) == Sample.Status.ABORTED for sample in sample_or_group)
     return getattr(sample_or_group, "status", None) == Sample.Status.ABORTED
+
+
+def _iter_samples(sample_or_group: Sample | list[Sample]):
+    if isinstance(sample_or_group, list):
+        yield from sample_or_group
+    else:
+        yield sample_or_group
+
+
+def _invalid_generated_unit_reason(args, sample_or_group: Sample | list[Sample]) -> str | None:
+    for sample in _iter_samples(sample_or_group):
+        rollout_max_response_len = getattr(args, "rollout_max_response_len", None)
+        rollout_max_context_len = getattr(args, "rollout_max_context_len", None)
+        if rollout_max_response_len is not None and sample.response_length > rollout_max_response_len:
+            return (
+                f"sample index={sample.index} response_length={sample.response_length} "
+                f"> rollout_max_response_len={rollout_max_response_len}"
+            )
+        if rollout_max_context_len is not None and len(sample.tokens) > rollout_max_context_len:
+            return (
+                f"sample index={sample.index} total_length={len(sample.tokens)} "
+                f"> rollout_max_context_len={rollout_max_context_len}"
+            )
+    return None

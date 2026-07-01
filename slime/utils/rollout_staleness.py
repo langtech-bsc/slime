@@ -108,6 +108,38 @@ def discard_stale_rollout_samples(
     return stats
 
 
+def raise_on_stale_rollout_samples(
+    rollout_data: dict[str, Any],
+    trainer_weight_version: int,
+    max_staleness: int,
+) -> RolloutStalenessStats:
+    """Validate that pre-training filtering removed stale rollout samples."""
+    weight_versions = rollout_data.get("weight_versions")
+    if not weight_versions:
+        return RolloutStalenessStats(unknown_version=len(rollout_data.get("loss_masks", [])))
+
+    stale: list[tuple[int, int, list[str] | None]] = []
+    unknown_version = 0
+    for index, versions in enumerate(weight_versions):
+        staleness = rollout_weight_staleness(trainer_weight_version, versions)
+        if staleness is None:
+            unknown_version += 1
+            continue
+        if staleness > max_staleness:
+            stale.append((index, staleness, versions))
+
+    eligible = len(weight_versions) - unknown_version
+    stats = RolloutStalenessStats(discarded=len(stale), eligible=eligible, unknown_version=unknown_version)
+    if stale:
+        preview = stale[:8]
+        raise ValueError(
+            "Stale rollout samples reached actor training after pre-training filtering: "
+            f"trainer_weight_version={trainer_weight_version}, max_staleness={max_staleness}, "
+            f"stale_count={len(stale)}, preview={preview}"
+        )
+    return stats
+
+
 def _loss_mask_is_active(mask: Any) -> bool:
     if torch.is_tensor(mask):
         return int(mask.sum().item()) > 0
@@ -151,9 +183,11 @@ def log_rollout_weight_staleness_metrics(
     *,
     trainer_weight_version: int,
     max_staleness: int,
+    num_steps_per_rollout: int,
     rollout_data: dict[str, Any] | None = None,
+    filter_metrics: dict[str, float | int] | None = None,
 ) -> None:
-    """Log per-rollout staleness discard counts to stdout and tracking backends."""
+    """Log pre-filter staleness drops and actor-side staleness distribution."""
     if stats is None:
         return
 
@@ -163,25 +197,38 @@ def log_rollout_weight_staleness_metrics(
         return
 
     from slime.backends.megatron_utils.data import gather_log_data
-    from slime.utils.metric_utils import compute_rollout_step
+    from slime.utils.metric_utils import compute_train_step
 
+    original_samples = int(filter_metrics.get("original_samples", 0)) if filter_metrics else 0
+    dropped_stale_samples = int(filter_metrics.get("dropped_stale_samples", 0)) if filter_metrics else 0
     log_dict = {
-        "discarded": (stats.discarded, 1),
-        "eligible": (stats.eligible, 1),
-        "kept": (stats.kept, 1),
-        "unknown_version": (stats.unknown_version, 1),
-        "discard_ratio": (stats.discarded, max(stats.eligible, 1)),
+        "dropped_stale_samples": (dropped_stale_samples, 1),
+        "eligible_at_actor": (stats.eligible, 1),
+        "unknown_version_at_actor": (stats.unknown_version, 1),
+        "stale_drop_ratio": (dropped_stale_samples, max(original_samples, 1)),
         "trainer_weight_version": (trainer_weight_version, 1),
         "max_staleness": (max_staleness, 1),
     }
+    if filter_metrics is not None:
+        log_dict["sample_keep_ratio"] = (
+            filter_metrics.get("kept_samples", 0),
+            max(original_samples, 1),
+        )
     gather_log_data("rollout_weight_staleness", args, rollout_id, log_dict)
 
-    step = compute_rollout_step(args, rollout_id)
+    train_step = compute_train_step(rollout_id, num_steps_per_rollout)
     wandb_payload: dict[str, float | int] = {
-        "train/rollout_weight_staleness_discarded": stats.discarded,
-        "train/rollout_weight_staleness_discard_ratio": stats.discard_ratio,
-        "train/step": step,
+        "train/step": train_step,
+        "train/rollout_weight_staleness_eligible": stats.eligible,
+        "train/rollout_weight_staleness_unknown_version": stats.unknown_version,
     }
+    if filter_metrics is not None:
+        wandb_payload["train/rollout_filter_dropped_stale_samples"] = dropped_stale_samples
+        if original_samples:
+            wandb_payload["train/rollout_filter_dropped_stale_ratio"] = dropped_stale_samples / original_samples
+        sample_keep_ratio = filter_metrics.get("sample_keep_ratio")
+        if sample_keep_ratio is not None:
+            wandb_payload["train/rollout_filter_sample_keep_ratio"] = float(sample_keep_ratio)
     if rollout_data is not None:
         weight_stats = rollout_weight_staleness_stats_for_training(rollout_data, trainer_weight_version)
         if weight_stats.mean is not None:

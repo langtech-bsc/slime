@@ -313,6 +313,26 @@ class Sample:
 
         self._validate_response_metadata_lengths()
 
+    def reset_generation_state(self) -> None:
+        """Clear generated response state before retrying a sample."""
+        prompt_length = max(0, len(self.tokens) - int(self.response_length or 0))
+        self.tokens = self.tokens[:prompt_length]
+        self.response = ""
+        self.response_length = 0
+        self.reward = None
+        self.loss_mask = None
+        self.weight_versions = []
+        self.rollout_log_probs = None
+        self.rollout_top_p_token_ids = None
+        self.rollout_top_p_token_offsets = None
+        self.rollout_routed_experts = None
+        self.remove_sample = False
+        self.teacher_log_probs = None
+        self.status = Sample.Status.PENDING
+        self.spec_info = Sample.SpecInfo()
+        self.prefix_cache_info = Sample.PrefixCacheInfo()
+        self.non_generation_time = 0.0
+
     def _apply_meta_info(
         self,
         args,

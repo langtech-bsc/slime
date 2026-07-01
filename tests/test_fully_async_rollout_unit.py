@@ -174,6 +174,95 @@ def test_fully_async_rewards_already_completed_unrewarded_sample(monkeypatch):
 
 
 @pytest.mark.unit
+def test_fully_async_requeued_aborted_group_resets_generation_state(monkeypatch):
+    from collections import deque
+
+    from slime.rollout import fully_async_rollout
+
+    monkeypatch.setattr(fully_async_rollout, "GenerateState", _FakeGenerateState)
+
+    data_source = _FiniteDataSource(groups=0, group_size=1)
+    worker = AsyncRolloutWorker(
+        _args(rollout_max_response_len=10, rollout_max_context_len=16),
+        data_source,
+        generation_concurrency=1,
+        reward_concurrency=1,
+        max_reward_backlog_groups=8,
+        max_inference_groups=99,
+        max_reward_groups=99,
+    )
+    sample = Sample(index=1, prompt="prompt")
+    sample.tokens = [1, 2, 3, 4]
+    sample.response = "partial"
+    sample.response_length = 2
+    sample.loss_mask = [1, 1]
+    sample.rollout_log_probs = [-1.0, -1.0]
+    sample.weight_versions = ["13"]
+    sample.status = Sample.Status.ABORTED
+    group = GroupState(gid=1, samples=[sample])
+    groups = {1: group}
+
+    async def done():
+        return sample
+
+    async def run_case():
+        task = asyncio.create_task(done())
+        await task
+        await worker._handle_generation_done(task, 1, 0, groups, deque())
+
+    asyncio.run(run_case())
+
+    assert groups == {}
+    assert data_source.requeued == [[sample]]
+    assert sample.tokens == [1, 2]
+    assert sample.response_length == 0
+    assert sample.loss_mask is None
+    assert sample.rollout_log_probs is None
+    assert sample.weight_versions == []
+    assert sample.status == Sample.Status.PENDING
+
+
+@pytest.mark.unit
+def test_fully_async_drops_overlength_generated_sample_before_reward(monkeypatch):
+    from collections import deque
+
+    from slime.rollout import fully_async_rollout
+
+    monkeypatch.setattr(fully_async_rollout, "GenerateState", _FakeGenerateState)
+
+    worker = AsyncRolloutWorker(
+        _args(rollout_max_response_len=10, rollout_max_context_len=16),
+        _FiniteDataSource(groups=0, group_size=1),
+        generation_concurrency=1,
+        reward_concurrency=1,
+        max_reward_backlog_groups=8,
+        max_inference_groups=99,
+        max_reward_groups=99,
+    )
+    sample = Sample(index=1, prompt="prompt")
+    sample.tokens = list(range(15))
+    sample.response_length = 11
+    sample.status = Sample.Status.COMPLETED
+    group = GroupState(gid=1, samples=[sample])
+    groups = {1: group}
+    pending_reward = deque()
+
+    async def done():
+        return sample
+
+    async def run_case():
+        task = asyncio.create_task(done())
+        await task
+        await worker._handle_generation_done(task, 1, 0, groups, pending_reward)
+
+    asyncio.run(run_case())
+
+    assert groups == {}
+    assert not pending_reward
+    assert worker.metrics.generation_invalid_groups == 1
+
+
+@pytest.mark.unit
 def test_fully_async_generation_concurrency_is_counted_per_sample(monkeypatch):
     from slime.rollout import fully_async_rollout
 

@@ -181,12 +181,16 @@ def first_fit_pack(total_lengths, max_tokens_per_bin):
     """First-fit bin packing.
 
     Returns ``list[list[int]]`` — each bin is a list of indices into ``total_lengths``.
-    Bin sums are ``<= max_tokens_per_bin`` whenever every individual ``length`` fits;
-    an oversized sample lands alone in its own bin with sum equal to its length.
+    Bin sums are ``<= max_tokens_per_bin``. Oversized samples must be filtered
+    before scheduling.
     """
     bins: list[list[int]] = []
     bin_sums: list[int] = []
     for idx, length in enumerate(total_lengths):
+        if length > max_tokens_per_bin:
+            raise ValueError(
+                f"sample length {length} at index {idx} exceeds max_tokens_per_bin={max_tokens_per_bin}"
+            )
         for j in range(len(bins)):
             if bin_sums[j] + length <= max_tokens_per_bin:
                 bins[j].append(idx)

@@ -151,6 +151,9 @@ class RayTrainGroup:
         """Broadcast weights from rank 0 to all other ranks."""
         return ray.get([actor.update_weights.remote() for actor in self._actor_handlers])
 
+    def get_weight_version(self):
+        return ray.get(self._actor_handlers[0].get_weight_version.remote())
+
     def onload(self):
         return ray.get([actor.wake_up.remote() for actor in self._actor_handlers])
 

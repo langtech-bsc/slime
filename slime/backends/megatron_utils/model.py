@@ -28,6 +28,7 @@ try:
 except ImportError:
     from megatron.core.utils import unwrap_model
 from slime.utils import logging_utils
+from slime.utils.dp_schedule import compute_pack_fullness_stats
 from slime.utils.memory_utils import clear_memory
 
 from .checkpoint import load_checkpoint, save_checkpoint
@@ -623,6 +624,53 @@ def should_disable_forward_pre_hook(args: Namespace) -> bool:
     return args.use_distributed_optimizer and args.overlap_param_gather
 
 
+def _get_step_pack_fullness_metrics(
+    args: Namespace,
+    data_iterator: Sequence[DataIterator],
+    step_start_microbatch: int,
+    step_num_microbatches: int,
+) -> dict[str, float]:
+    """Compute train/pack fullness metrics for the current Megatron step."""
+    if args.max_tokens_per_gpu is None or not data_iterator:
+        return {}
+
+    iterator = data_iterator[0]
+    step_microbatches = iterator.micro_batch_indices[
+        step_start_microbatch : step_start_microbatch + step_num_microbatches
+    ]
+    if not step_microbatches:
+        return {}
+
+    capacity = args.max_tokens_per_gpu * mpu.get_context_parallel_world_size()
+    local_stats = compute_pack_fullness_stats(
+        iterator.rollout_data["total_lengths"],
+        step_microbatches,
+        capacity,
+    )
+
+    device = torch.device("cuda", torch.cuda.current_device()) if torch.cuda.is_available() else torch.device("cpu")
+    sum_count = torch.tensor(
+        [local_stats["mean"] * len(step_microbatches), float(len(step_microbatches))],
+        dtype=torch.float64,
+        device=device,
+    )
+    max_value = torch.tensor(local_stats["max"], dtype=torch.float64, device=device)
+    min_value = torch.tensor(local_stats["min"], dtype=torch.float64, device=device)
+
+    dp_group = mpu.get_data_parallel_group(with_context_parallel=False)
+    torch.distributed.all_reduce(sum_count, op=torch.distributed.ReduceOp.SUM, group=dp_group)
+    torch.distributed.all_reduce(max_value, op=torch.distributed.ReduceOp.MAX, group=dp_group)
+    torch.distributed.all_reduce(min_value, op=torch.distributed.ReduceOp.MIN, group=dp_group)
+
+    total_count = sum_count[1].item()
+    mean_value = sum_count[0].item() / total_count if total_count else 0.0
+    return {
+        "train/pack_fullness_mean": mean_value,
+        "train/pack_fullness_max": max_value.item(),
+        "train/pack_fullness_min": min_value.item(),
+    }
+
+
 def train(
     rollout_id: int,
     model: Sequence[DDP],
@@ -740,7 +788,9 @@ def train(
     )
 
     # Run training iterations till done.
+    step_start_microbatch = 0
     for step_id in range(num_steps_per_rollout):
+        step_num_microbatches = num_microbatches[step_id]
 
         # Run training step.
         loss_dict, grad_norm = train_one_step(
@@ -751,7 +801,7 @@ def train(
             model,
             optimizer,
             opt_param_scheduler,
-            num_microbatches[step_id],
+            step_num_microbatches,
             global_batch_sizes[step_id],
             microbatch_pbar=microbatch_pbar,
         )
@@ -786,6 +836,16 @@ def train(
 
                     check_mtp_loss(mtp_losses)
 
+        role = getattr(model[0], "role", "actor")
+        pack_log_dict = {}
+        if role == "actor" and mpu.get_tensor_model_parallel_rank() == 0 and mpu.is_pipeline_last_stage(ignore_virtual=True):
+            pack_log_dict = _get_step_pack_fullness_metrics(
+                args,
+                data_iterator,
+                step_start_microbatch,
+                step_num_microbatches,
+            )
+
         # per train step log.
         if (
             mpu.get_data_parallel_rank(with_context_parallel=True) == 0
@@ -793,7 +853,6 @@ def train(
             and mpu.get_pipeline_model_parallel_rank() == mpu.get_pipeline_model_parallel_world_size() - 1
         ):
             accumulated_step_id = rollout_id * num_steps_per_rollout + step_id
-            role = getattr(model[0], "role", "actor")
             role_tag = "" if role == "actor" else f"{role}-"
             log_dict = {
                 f"train/{role_tag}{key}": val.mean().item() if isinstance(val, torch.Tensor) else val
@@ -802,6 +861,9 @@ def train(
             log_dict[f"train/{role_tag}grad_norm"] = grad_norm
             if args.enable_mtp_training:
                 log_dict[f"train/{role_tag}mtp_loss"] = mtp_losses
+
+            if role == "actor":
+                log_dict.update(pack_log_dict)
 
             for param_group_id, param_group in enumerate(optimizer.param_groups):
                 log_dict[f"train/{role_tag}lr-pg_{param_group_id}"] = opt_param_scheduler.get_lr(param_group)
@@ -850,6 +912,7 @@ def train(
                     rel_tol=0.01,
                     abs_tol=0.01,
                 ), f"grad norm mismatch: {grad_norm} != {expected_grad_norm}"
+        step_start_microbatch += step_num_microbatches
     microbatch_pbar.close()
     # Close out pre-hooks if using distributed optimizer and overlapped param gather.
     if pre_hook_enabled:

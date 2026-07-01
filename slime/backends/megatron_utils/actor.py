@@ -229,10 +229,16 @@ class MegatronTrainRayActor(TrainRayActor):
             mpu.get_data_parallel_world_size(with_context_parallel=False),
         )
         if self.args.max_rollout_weight_staleness is not None and self.role == "actor":
+            filter_metrics = rollout_data.get("rollout_filter_metrics")
+            effective_max_staleness = self.args.max_rollout_weight_staleness
+            if filter_metrics is not None:
+                effective_max_staleness = int(
+                    filter_metrics.get("effective_max_rollout_weight_staleness", effective_max_staleness)
+                )
             staleness_stats = raise_on_stale_rollout_samples(
                 rollout_data,
                 trainer_weight_version=self.weight_updater.weight_version,
-                max_staleness=self.args.max_rollout_weight_staleness,
+                max_staleness=effective_max_staleness,
             )
             rollout_data["rollout_weight_staleness_stats"] = staleness_stats
         self._validate_rollout_lengths_before_gpu(rollout_data)
@@ -559,12 +565,17 @@ class MegatronTrainRayActor(TrainRayActor):
             staleness_stats = rollout_data.pop("rollout_weight_staleness_stats", None)
             filter_metrics = rollout_data.pop("rollout_filter_metrics", None)
             if staleness_stats is not None and self.args.max_rollout_weight_staleness is not None:
+                effective_max_staleness = self.args.max_rollout_weight_staleness
+                if filter_metrics is not None:
+                    effective_max_staleness = int(
+                        filter_metrics.get("effective_max_rollout_weight_staleness", effective_max_staleness)
+                    )
                 log_rollout_weight_staleness_metrics(
                     rollout_id,
                     self.args,
                     staleness_stats,
                     trainer_weight_version=self.weight_updater.weight_version,
-                    max_staleness=self.args.max_rollout_weight_staleness,
+                    max_staleness=effective_max_staleness,
                     num_steps_per_rollout=len(num_microbatches),
                     rollout_data=rollout_data,
                     filter_metrics=filter_metrics,

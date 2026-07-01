@@ -149,6 +149,26 @@ class GenerateState(metaclass=SingletonMeta):
         self.remaining_batch_size += len(samples)
 
 
+def clamp_sampling_params_for_sample(
+    args: Namespace,
+    sample: Sample,
+    sampling_params: dict[str, Any],
+    *,
+    prompt_token_count: int,
+) -> dict[str, Any]:
+    """Cap ``max_new_tokens`` to the remaining trajectory and context budgets."""
+    max_new_tokens = int(sampling_params["max_new_tokens"])
+    rollout_max_response_len = getattr(args, "rollout_max_response_len", None)
+    rollout_max_context_len = getattr(args, "rollout_max_context_len", None)
+    if rollout_max_response_len is not None:
+        max_new_tokens = min(max_new_tokens, max(0, rollout_max_response_len - sample.response_length))
+    if rollout_max_context_len is not None:
+        max_new_tokens = min(max_new_tokens, max(0, rollout_max_context_len - prompt_token_count))
+    clamped = sampling_params.copy()
+    clamped["max_new_tokens"] = max_new_tokens
+    return clamped
+
+
 async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, Any]) -> Sample:
     """Generate using traditional SGLang router with token-based workflow"""
     if args.ci_test:
@@ -162,15 +182,14 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
     ), f"Sample status is {sample.status}"
 
     prompt_ids = _prepare_prompt_ids(sample, state.tokenizer, state.processor)
-    max_new_tokens = int(sampling_params["max_new_tokens"])
+    sampling_params = clamp_sampling_params_for_sample(
+        args,
+        sample,
+        sampling_params,
+        prompt_token_count=len(prompt_ids),
+    )
     rollout_max_response_len = getattr(args, "rollout_max_response_len", None)
     rollout_max_context_len = getattr(args, "rollout_max_context_len", None)
-    if rollout_max_response_len is not None:
-        max_new_tokens = min(max_new_tokens, max(0, rollout_max_response_len - sample.response_length))
-    if rollout_max_context_len is not None:
-        max_new_tokens = min(max_new_tokens, max(0, rollout_max_context_len - len(prompt_ids)))
-    sampling_params = sampling_params.copy()
-    sampling_params["max_new_tokens"] = max_new_tokens
 
     assert (
         sampling_params["max_new_tokens"] >= 0

@@ -9,6 +9,7 @@ from slime.utils.rollout_staleness import (
     discard_stale_rollout_samples,
     min_rollout_weight_version,
     raise_on_stale_rollout_samples,
+    resolve_effective_max_staleness,
     rollout_weight_staleness,
     rollout_weight_staleness_stats_for_training,
 )
@@ -22,6 +23,23 @@ def test_min_rollout_weight_version_uses_oldest_version():
 def test_rollout_weight_staleness():
     assert rollout_weight_staleness(10, ["7"]) == 3
     assert rollout_weight_staleness(10, ["7", "9"]) == 3
+
+
+def test_resolve_effective_max_staleness_relaxes_when_batch_is_uniformly_fresh():
+    assert resolve_effective_max_staleness(3, [2, 2, 2, 4]) == 5
+
+
+def test_resolve_effective_max_staleness_stays_strict_when_batch_max_is_high():
+    assert resolve_effective_max_staleness(3, [2, 2, 2, 7]) == 3
+
+
+def test_resolve_effective_max_staleness_stays_strict_for_pathological_gap():
+    assert resolve_effective_max_staleness(3, [2, 2, 40]) == 3
+
+
+def test_resolve_effective_max_staleness_without_gaps_returns_base():
+    assert resolve_effective_max_staleness(3, []) == 3
+    assert resolve_effective_max_staleness(None, [1, 2]) is None
 
 
 def test_discard_stale_rollout_samples_zeros_masks_and_recomputes_rollout_totals():

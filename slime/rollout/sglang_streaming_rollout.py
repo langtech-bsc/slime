@@ -29,7 +29,7 @@ import logging
 from argparse import Namespace
 from typing import Any
 
-from slime.rollout.sglang_rollout import GenerateState, _prepare_prompt_ids
+from slime.rollout.sglang_rollout import GenerateState, _prepare_prompt_ids, clamp_sampling_params_for_sample
 from slime.utils import http_utils
 from slime.utils.processing_utils import encode_image_for_rollout_engine
 from slime.utils.trace_utils import build_sglang_meta_trace_attrs, trace_span
@@ -58,6 +58,12 @@ async def generate_streaming(args: Namespace, sample: Sample, sampling_params: d
     ), f"Sample status is {sample.status}"
 
     prompt_ids = _prepare_prompt_ids(sample, state.tokenizer, state.processor)
+    sampling_params = clamp_sampling_params_for_sample(
+        args,
+        sample,
+        sampling_params,
+        prompt_token_count=len(prompt_ids),
+    )
 
     assert (
         sampling_params["max_new_tokens"] >= 0

@@ -333,6 +333,11 @@ class Sample:
         self.prefix_cache_info = Sample.PrefixCacheInfo()
         self.non_generation_time = 0.0
 
+    def mark_pending_for_trajectory_resume(self) -> None:
+        """Requeue an aborted sample while preserving its partial trajectory."""
+        self.reward = None
+        self.status = Sample.Status.PENDING
+
     def _apply_meta_info(
         self,
         args,

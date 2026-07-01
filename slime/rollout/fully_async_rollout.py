@@ -359,7 +359,7 @@ class AsyncRolloutWorker:
         if _contains_aborted(generated):
             group.dropped = True
             for sample in group.samples:
-                sample.reset_generation_state()
+                sample.mark_pending_for_trajectory_resume()
             try:
                 self.data_buffer.add_samples([group.samples])
             except Exception:  # noqa: BLE001

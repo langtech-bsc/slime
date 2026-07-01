@@ -27,7 +27,11 @@ from slime.utils.logging_utils import configure_logger, init_tracking
 from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step, compute_statistics, dict_add_prefix
 from slime.utils.misc import Box, group_by, load_function
 from slime.utils.rollout_dump_utils import AsyncRolloutDumper, RolloutDumpJob, load_rollout_dump, resolve_rollout_dump_load_path
-from slime.utils.rollout_staleness import rollout_weight_staleness
+from slime.utils.rollout_staleness import (
+    compute_rollout_staleness_gaps,
+    resolve_effective_max_staleness,
+    rollout_weight_staleness,
+)
 from slime.utils.types import Sample
 
 from ..utils.metric_utils import has_repetition
@@ -869,9 +873,10 @@ class RolloutManager:
         :func:`build_dp_schedule` so it stays unit-testable without Ray/sglang.
 
         Step split is by rollout id (``samples[i].rollout_id``, falling back
-        to ``samples[i].index``); each step holds exactly
-        ``args.global_batch_size`` rollouts so the training-step count per
-        rollout is fixed at ``rollout_batch_size * n_samples_per_prompt //
+        to ``samples[i].index``). Full steps hold ``args.global_batch_size``
+        rollouts; after pre-training filtering a partial step may use fewer
+        rollouts (recorded in ``global_batch_sizes``). Nominal training-step
+        count per rollout is ``rollout_batch_size * n_samples_per_prompt //
         global_batch_size`` regardless of how many training samples each
         rollout produced.
         """
@@ -886,6 +891,9 @@ class RolloutManager:
             global_batch_size=self.args.global_batch_size,
             rollout_indices=data["rollout_ids"],
         )
+
+        if "rollout_filter_metrics" in data:
+            data["rollout_filter_metrics"]["effective_step_global_batch_size"] = sum(global_batch_sizes)
 
         # Package per-rank rollout_data
         rollout_data_refs = []
@@ -1008,13 +1016,17 @@ def _sample_length_drop_reason(args, sample: Sample, train_parallel_config: dict
     return None
 
 
-def _sample_stale_drop_reason(args, sample: Sample, trainer_weight_version: int | None) -> str | None:
-    if trainer_weight_version is None or args.max_rollout_weight_staleness is None:
+def _sample_stale_drop_reason(
+    sample: Sample,
+    trainer_weight_version: int | None,
+    effective_max_staleness: int | None,
+) -> str | None:
+    if trainer_weight_version is None or effective_max_staleness is None:
         return None
     staleness = rollout_weight_staleness(trainer_weight_version, sample.weight_versions)
-    if staleness is None or staleness <= args.max_rollout_weight_staleness:
+    if staleness is None or staleness <= effective_max_staleness:
         return None
-    return f"staleness>{args.max_rollout_weight_staleness}"
+    return f"staleness>{effective_max_staleness}"
 
 
 def _filter_rollout_groups_for_training(
@@ -1028,6 +1040,14 @@ def _filter_rollout_groups_for_training(
     survival_rate = float(getattr(args, "rollout_group_min_survival_rate", 0.8))
     if survival_rate < 0 or survival_rate > 1:
         raise ValueError(f"rollout_group_min_survival_rate must be in [0, 1], got {survival_rate}")
+
+    all_samples = [sample for group in groups for sample in group]
+    base_max_staleness = args.max_rollout_weight_staleness
+    staleness_gaps: list[int] = []
+    effective_max_staleness = base_max_staleness
+    if trainer_weight_version is not None and base_max_staleness is not None:
+        staleness_gaps = compute_rollout_staleness_gaps(all_samples, trainer_weight_version)
+        effective_max_staleness = resolve_effective_max_staleness(base_max_staleness, staleness_gaps)
 
     kept_groups: list[list[Sample]] = []
     dropped_stale_samples = 0
@@ -1058,7 +1078,7 @@ def _filter_rollout_groups_for_training(
                 )
                 continue
 
-            stale_reason = _sample_stale_drop_reason(args, sample, trainer_weight_version)
+            stale_reason = _sample_stale_drop_reason(sample, trainer_weight_version, effective_max_staleness)
             if stale_reason is not None:
                 dropped_stale_samples += 1
                 logger.info(
@@ -1105,6 +1125,14 @@ def _filter_rollout_groups_for_training(
         "dropped_length_samples": dropped_length_samples,
         "dropped_survival_samples": dropped_survival_samples,
     }
+    if base_max_staleness is not None:
+        metrics["base_max_rollout_weight_staleness"] = base_max_staleness
+        metrics["effective_max_rollout_weight_staleness"] = (
+            effective_max_staleness if effective_max_staleness is not None else base_max_staleness
+        )
+        if staleness_gaps:
+            metrics["mean_rollout_weight_staleness"] = sum(staleness_gaps) / len(staleness_gaps)
+            metrics["max_rollout_weight_staleness"] = max(staleness_gaps)
     metrics["sample_keep_ratio"] = kept_samples / original_samples if original_samples else 0.0
     metrics["group_keep_ratio"] = len(kept_groups) / len(groups) if groups else 0.0
 

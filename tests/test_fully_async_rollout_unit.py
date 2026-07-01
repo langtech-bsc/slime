@@ -174,7 +174,7 @@ def test_fully_async_rewards_already_completed_unrewarded_sample(monkeypatch):
 
 
 @pytest.mark.unit
-def test_fully_async_requeued_aborted_group_resets_generation_state(monkeypatch):
+def test_fully_async_requeued_aborted_group_preserves_trajectory_for_resume(monkeypatch):
     from collections import deque
 
     from slime.rollout import fully_async_rollout
@@ -214,12 +214,13 @@ def test_fully_async_requeued_aborted_group_resets_generation_state(monkeypatch)
 
     assert groups == {}
     assert data_source.requeued == [[sample]]
-    assert sample.tokens == [1, 2]
-    assert sample.response_length == 0
-    assert sample.loss_mask is None
-    assert sample.rollout_log_probs is None
-    assert sample.weight_versions == []
+    assert sample.tokens == [1, 2, 3, 4]
+    assert sample.response_length == 2
+    assert sample.loss_mask == [1, 1]
+    assert sample.rollout_log_probs == [-1.0, -1.0]
+    assert sample.weight_versions == ["13"]
     assert sample.status == Sample.Status.PENDING
+    assert sample.reward is None
 
 
 @pytest.mark.unit

@@ -329,12 +329,80 @@ def test_trims_trailing_rollouts_that_dont_fill_a_step():
 
 
 @pytest.mark.unit
-def test_rejects_when_fewer_rollouts_than_gbs():
-    """gbs=4 with only 3 distinct rollouts → cannot form one step."""
+def test_partial_step_when_fewer_rollouts_than_gbs():
+    """gbs=4 with only 3 distinct rollouts → one partial step of size 3."""
     args = make_args(use_dynamic_batch_size=True, max_tokens_per_gpu=12)
     tp = make_tp(dp_size=1)
-    with pytest.raises(AssertionError, match="num_rollouts"):
-        build_dp_schedule(args, tp, [3] * 6, global_batch_size=4, rollout_indices=[0, 0, 1, 1, 2, 2])
+    rollout_indices = [0, 0, 1, 1, 2, 2]
+    partitions, mbi, nmb, gbs_per_step = build_dp_schedule(
+        args, tp, [3] * 6, global_batch_size=4, rollout_indices=rollout_indices
+    )
+
+    assert gbs_per_step == [3]
+    assert_invariants(
+        partitions,
+        mbi,
+        nmb,
+        dp_size=1,
+        expected_global_sample_indices=range(6),
+        total_lengths=[3] * 6,
+        max_per_bin=12,
+    )
+
+
+@pytest.mark.unit
+def test_salamandra_partial_filter_scenario():
+    """511 rollouts after staleness filter with nominal gbs=512 → one partial step."""
+    total_lengths = [10] * 511
+    rollout_indices = list(range(511))
+    args = make_args(use_dynamic_batch_size=True, max_tokens_per_gpu=16384)
+    tp = make_tp(dp_size=8)
+
+    partitions, mbi, nmb, gbs_per_step = build_dp_schedule(
+        args, tp, total_lengths, global_batch_size=512, rollout_indices=rollout_indices
+    )
+
+    assert gbs_per_step == [511]
+    assert_invariants(
+        partitions,
+        mbi,
+        nmb,
+        dp_size=8,
+        expected_global_sample_indices=range(511),
+        total_lengths=total_lengths,
+    )
+
+
+@pytest.mark.unit
+def test_full_step_unchanged_when_gbs_met():
+    """512 rollouts with gbs=512 → one full step (regression)."""
+    total_lengths = [10] * 512
+    rollout_indices = list(range(512))
+    args = make_args(micro_batch_size=1)
+    tp = make_tp(dp_size=8)
+
+    partitions, mbi, nmb, gbs_per_step = build_dp_schedule(
+        args, tp, total_lengths, global_batch_size=512, rollout_indices=rollout_indices
+    )
+
+    assert gbs_per_step == [512]
+    assert_invariants(
+        partitions,
+        mbi,
+        nmb,
+        dp_size=8,
+        expected_global_sample_indices=range(512),
+        total_lengths=total_lengths,
+    )
+
+
+@pytest.mark.unit
+def test_rejects_when_no_rollouts():
+    """Empty rollout list must fail before scheduling."""
+    args = make_args(use_dynamic_batch_size=True, max_tokens_per_gpu=12)
+    tp = make_tp(dp_size=1)
+    with pytest.raises(ValueError, match="no rollouts to schedule"):
+        build_dp_schedule(args, tp, [], global_batch_size=4, rollout_indices=[])
 
 
 if __name__ == "__main__":

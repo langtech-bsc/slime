@@ -307,5 +307,26 @@ def test_reset_generation_state_preserves_prompt_tokens_and_clears_response_stat
     assert sample.status == Sample.Status.PENDING
 
 
+@pytest.mark.unit
+def test_mark_pending_for_trajectory_resume_preserves_partial_trajectory():
+    sample = Sample(index=1, prompt="prompt")
+    sample.tokens = [10, 11, 12, 13]
+    sample.response = "partial"
+    sample.response_length = 2
+    sample.reward = 1.0
+    sample.loss_mask = [1, 1]
+    sample.weight_versions = ["13"]
+    sample.status = Sample.Status.ABORTED
+
+    sample.mark_pending_for_trajectory_resume()
+
+    assert sample.tokens == [10, 11, 12, 13]
+    assert sample.response_length == 2
+    assert sample.loss_mask == [1, 1]
+    assert sample.weight_versions == ["13"]
+    assert sample.reward is None
+    assert sample.status == Sample.Status.PENDING
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))

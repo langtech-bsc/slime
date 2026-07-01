@@ -9,10 +9,13 @@ The scheduling philosophy is **pack first, distribute second**:
 
   1. Group samples by rollout id (``rollout_indices[i]`` =
      ``samples[i].index``) and split rollouts into steps of
-     ``global_batch_size`` rollouts each. In the common case one rollout
-     emits one training sample so this is the same as a contiguous chunk;
-     under compact / subagent one rollout may emit multiple training
-     samples, in which case all of those samples stay in the same step.
+     ``global_batch_size`` rollouts each. When pre-training filtering
+     leaves fewer than ``global_batch_size`` rollouts, schedule one
+     partial step using the actual kept rollout count. In the common case
+     one rollout emits one training sample so this is the same as a
+     contiguous chunk; under compact / subagent one rollout may emit
+     multiple training samples, in which case all of those samples stay
+     in the same step.
   2. For each step, pack its samples into ``K`` micro-batches with a
      single first-fit pass (dynamic batch) or fixed-size chunking
      (static batch).
@@ -125,17 +128,21 @@ def build_dp_schedule(
         train_parallel_config: ``{"dp_size", "cp_size", "vpp_size",
             "microbatch_group_size_per_vp_stage"}``.
         total_lengths: token count per sample, indexed globally.
-        global_batch_size: number of rollouts (NOT training samples) per
-            training step. Number of training steps =
+        global_batch_size: nominal number of rollouts (NOT training samples)
+            per full training step. When ``num_rollouts < global_batch_size``
+            (e.g. after pre-training filtering), one partial step is
+            scheduled with the actual kept rollout count. When
+            ``num_rollouts >= global_batch_size``, number of full steps =
             ``num_rollouts // global_batch_size``; trailing rollouts whose
-            samples don't fit are dropped.
+            samples don't fill a step are dropped.
         rollout_indices: rollout id for each sample (``samples[i].index``).
             Samples sharing the same id are kept together in one step.
 
     Returns:
         ``(partitions, micro_batch_indices, num_microbatches, global_batch_sizes)``.
-        ``global_batch_sizes[s]`` = rollout count for step s (constant
-        ``global_batch_size`` for every step).
+        ``global_batch_sizes[s]`` = rollout count for step s (equals
+        ``global_batch_size`` for full steps, or the kept count for a
+        partial step).
     """
     dp_size = train_parallel_config["dp_size"]
     cp_size = train_parallel_config["cp_size"]
@@ -160,22 +167,28 @@ def build_dp_schedule(
         rollout_id_to_samples.setdefault(rid, []).append(sample_pos)
     rollout_ids = list(rollout_id_to_samples.keys())
 
-    num_steps = len(rollout_ids) // global_batch_size
-    assert num_steps >= 1, (
-        f"num_rollouts ({len(rollout_ids)}) < global_batch_size ({global_batch_size}); "
-        f"need at least one rollout per step."
-    )
+    num_rollouts = len(rollout_ids)
+    if num_rollouts == 0:
+        raise ValueError("no rollouts to schedule")
+
+    num_full_steps = num_rollouts // global_batch_size
+    if num_full_steps == 0:
+        step_specs = [(0, num_rollouts, num_rollouts)]
+    else:
+        step_specs = [
+            (i * global_batch_size, (i + 1) * global_batch_size, global_batch_size) for i in range(num_full_steps)
+        ]
 
     partitions: list[list[int]] = [[] for _ in range(dp_size)]
     micro_batch_indices: list[list[list[int]]] = [[] for _ in range(dp_size)]
     num_microbatches: list[int] = []
     global_batch_sizes: list[int] = []
 
-    for step_i in range(num_steps):
-        step_rollouts = rollout_ids[step_i * global_batch_size : (step_i + 1) * global_batch_size]
+    for step_i, (start, end, step_gbs) in enumerate(step_specs):
+        step_rollouts = rollout_ids[start:end]
         sample_indices = [pos for rid in step_rollouts for pos in rollout_id_to_samples[rid]]
         step_lengths = [total_lengths[i] for i in sample_indices]
-        global_batch_sizes.append(global_batch_size)
+        global_batch_sizes.append(step_gbs)
         assert len(sample_indices) >= dp_size, (
             f"step {step_i}: {len(sample_indices)} samples < dp_size {dp_size}; "
             f"each step needs at least one sample per rank."

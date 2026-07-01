@@ -13,6 +13,11 @@ from slime.utils import logging_utils
 
 logger = logging.getLogger(__name__)
 
+# Batch-level thresholds for relaxing the staleness cap when the rollout batch is uniformly fresh.
+STALENESS_RELAX_MEAN_THRESHOLD = 3
+STALENESS_RELAX_MAX_THRESHOLD = 6
+STALENESS_RELAXED_MAX_STALENESS = 5
+
 
 @dataclass(frozen=True)
 class RolloutWeightStalenessStats:
@@ -59,6 +64,29 @@ def rollout_weight_staleness(trainer_weight_version: int, weight_versions: list[
     if rollout_version is None:
         return None
     return trainer_weight_version - rollout_version
+
+
+def compute_rollout_staleness_gaps(samples, trainer_weight_version: int) -> list[int]:
+    """Return per-sample trainer-minus-rollout gaps for samples with known versions."""
+    gaps: list[int] = []
+    for sample in samples:
+        gap = rollout_weight_staleness(trainer_weight_version, sample.weight_versions)
+        if gap is not None:
+            gaps.append(gap)
+    return gaps
+
+
+def resolve_effective_max_staleness(base: int | None, gaps: list[int]) -> int | None:
+    """Pick the staleness cap used for pre-training filtering and actor guard."""
+    if base is None:
+        return None
+    if not gaps:
+        return base
+    mean_gap = sum(gaps) / len(gaps)
+    max_gap = max(gaps)
+    if mean_gap < STALENESS_RELAX_MEAN_THRESHOLD and max_gap < STALENESS_RELAX_MAX_THRESHOLD:
+        return max(base, STALENESS_RELAXED_MAX_STALENESS)
+    return base
 
 
 def discard_stale_rollout_samples(
@@ -214,6 +242,15 @@ def log_rollout_weight_staleness_metrics(
             filter_metrics.get("kept_samples", 0),
             max(original_samples, 1),
         )
+        if "mean_rollout_weight_staleness" in filter_metrics:
+            log_dict["mean_rollout_weight_staleness"] = (filter_metrics["mean_rollout_weight_staleness"], 1)
+        if "max_rollout_weight_staleness" in filter_metrics:
+            log_dict["max_rollout_weight_staleness"] = (filter_metrics["max_rollout_weight_staleness"], 1)
+        if "effective_max_rollout_weight_staleness" in filter_metrics:
+            log_dict["effective_max_rollout_weight_staleness"] = (
+                filter_metrics["effective_max_rollout_weight_staleness"],
+                1,
+            )
     gather_log_data("rollout_weight_staleness", args, rollout_id, log_dict)
 
     train_step = compute_train_step(rollout_id, num_steps_per_rollout)
@@ -229,6 +266,10 @@ def log_rollout_weight_staleness_metrics(
         sample_keep_ratio = filter_metrics.get("sample_keep_ratio")
         if sample_keep_ratio is not None:
             wandb_payload["train/rollout_filter_sample_keep_ratio"] = float(sample_keep_ratio)
+        if "effective_max_rollout_weight_staleness" in filter_metrics:
+            wandb_payload["train/effective_max_rollout_weight_staleness"] = int(
+                filter_metrics["effective_max_rollout_weight_staleness"]
+            )
     if rollout_data is not None:
         weight_stats = rollout_weight_staleness_stats_for_training(rollout_data, trainer_weight_version)
         if weight_stats.mean is not None:

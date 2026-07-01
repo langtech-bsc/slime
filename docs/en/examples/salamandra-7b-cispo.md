@@ -152,10 +152,20 @@ Fully-async generation is capped at 8 prompt groups by default
 to limit concurrent long generations that drive weight staleness.
 Reward computation is capped the same way
 (`--fully-async-max-reward-groups`, override with `FULLY_ASYNC_MAX_REWARD_GROUPS`).
-Weight sync every rollout step (`update_weights_interval=1`). Samples with
-`trainer_weight_version - rollout_weight_version > 3` are dropped before training
-via `--max-rollout-weight-staleness 3` (override with `MAX_ROLLOUT_WEIGHT_STALENESS`).
+Weight sync every rollout step (`update_weights_interval=1`). Pre-training filtering
+uses `--max-rollout-weight-staleness 3` (override with `MAX_ROLLOUT_WEIGHT_STALENESS`)
+with a batch-level relaxation: when the rollout batch mean gap is below 3 **and**
+the batch max gap is below 6, the effective cap is raised to 5. Per-sample gaps
+still use `trainer_weight_version - min(sample.weight_versions)`.
+
+Fully-async abort/resume preserves partial trajectories: aborted samples are
+requeued with existing `response_length`, and each SGLang call is clamped to the
+remaining response budget (`rollout_max_response_len - response_length`) and
+context budget. A 5k-token partial trajectory can receive at most ~7k more
+tokens, not another full 12k.
+
 Logged metrics: `rollout_filter/dropped_stale_samples` (at `rollout/step`),
-`train/rollout_filter_dropped_stale_samples` and `train/mean_rollout_weight_staleness`
-(at `train/step`).
+`rollout_filter/effective_max_rollout_weight_staleness`,
+`train/rollout_filter_dropped_stale_samples`, `train/effective_max_rollout_weight_staleness`,
+and `train/mean_rollout_weight_staleness` (at `train/step`).
 ```

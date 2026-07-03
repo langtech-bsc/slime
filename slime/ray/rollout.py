@@ -30,7 +30,7 @@ from slime.utils.rollout_dump_utils import AsyncRolloutDumper, RolloutDumpJob, l
 from slime.utils.rollout_staleness import (
     compute_rollout_staleness_gaps,
     resolve_effective_max_staleness,
-    rollout_weight_staleness,
+    rollout_weight_staleness_gaps,
 )
 from slime.utils.types import Sample
 
@@ -1019,14 +1019,26 @@ def _sample_length_drop_reason(args, sample: Sample, train_parallel_config: dict
 def _sample_stale_drop_reason(
     sample: Sample,
     trainer_weight_version: int | None,
-    effective_max_staleness: int | None,
+    max_mean_staleness: float | None,
+    max_oldest_staleness: int | None,
 ) -> str | None:
-    if trainer_weight_version is None or effective_max_staleness is None:
+    if trainer_weight_version is None or max_mean_staleness is None or max_oldest_staleness is None:
         return None
-    staleness = rollout_weight_staleness(trainer_weight_version, sample.weight_versions)
-    if staleness is None or staleness <= effective_max_staleness:
+    staleness = rollout_weight_staleness_gaps(trainer_weight_version, sample.weight_versions)
+    if staleness is None:
         return None
-    return f"staleness>{effective_max_staleness}"
+    if staleness.mean > max_mean_staleness:
+        return f"mean_staleness>{max_mean_staleness:g}"
+    if staleness.max > max_oldest_staleness:
+        return f"max_staleness>{max_oldest_staleness}"
+    return None
+
+
+def _sample_reward_drop_reason(sample: Sample) -> str | None:
+    reward = sample.reward
+    if isinstance(reward, dict) and (reward.get("timeout") or reward.get("failure_type") == "timeout"):
+        return "reward_timeout"
+    return None
 
 
 def _filter_rollout_groups_for_training(
@@ -1044,14 +1056,24 @@ def _filter_rollout_groups_for_training(
     all_samples = [sample for group in groups for sample in group]
     base_max_staleness = args.max_rollout_weight_staleness
     staleness_gaps: list[int] = []
+    staleness_mean_gaps: list[float] = []
+    staleness_min_gaps: list[int] = []
     effective_max_staleness = base_max_staleness
     if trainer_weight_version is not None and base_max_staleness is not None:
         staleness_gaps = compute_rollout_staleness_gaps(all_samples, trainer_weight_version)
+        staleness_stats = [
+            gaps
+            for sample in all_samples
+            if (gaps := rollout_weight_staleness_gaps(trainer_weight_version, sample.weight_versions)) is not None
+        ]
+        staleness_mean_gaps = [gaps.mean for gaps in staleness_stats]
+        staleness_min_gaps = [gaps.min for gaps in staleness_stats]
         effective_max_staleness = resolve_effective_max_staleness(base_max_staleness, staleness_gaps)
 
     kept_groups: list[list[Sample]] = []
     dropped_stale_samples = 0
     dropped_length_samples = 0
+    dropped_reward_timeout_samples = 0
     dropped_survival_groups = 0
     dropped_survival_samples = 0
     original_samples = 0
@@ -1078,7 +1100,26 @@ def _filter_rollout_groups_for_training(
                 )
                 continue
 
-            stale_reason = _sample_stale_drop_reason(sample, trainer_weight_version, effective_max_staleness)
+            reward_reason = _sample_reward_drop_reason(sample)
+            if reward_reason is not None:
+                dropped_reward_timeout_samples += 1
+                logger.warning(
+                    "Dropping rollout sample before training due to %s: index=%s rollout_id=%s "
+                    "group_index=%s reward=%s",
+                    reward_reason,
+                    sample.index,
+                    sample.rollout_id,
+                    sample.group_index,
+                    sample.reward,
+                )
+                continue
+
+            stale_reason = _sample_stale_drop_reason(
+                sample,
+                trainer_weight_version,
+                base_max_staleness,
+                effective_max_staleness,
+            )
             if stale_reason is not None:
                 dropped_stale_samples += 1
                 logger.info(
@@ -1123,6 +1164,7 @@ def _filter_rollout_groups_for_training(
         "kept_samples": kept_samples,
         "dropped_stale_samples": dropped_stale_samples,
         "dropped_length_samples": dropped_length_samples,
+        "dropped_reward_timeout_samples": dropped_reward_timeout_samples,
         "dropped_survival_samples": dropped_survival_samples,
     }
     if base_max_staleness is not None:
@@ -1131,7 +1173,8 @@ def _filter_rollout_groups_for_training(
             effective_max_staleness if effective_max_staleness is not None else base_max_staleness
         )
         if staleness_gaps:
-            metrics["mean_rollout_weight_staleness"] = sum(staleness_gaps) / len(staleness_gaps)
+            metrics["mean_rollout_weight_staleness"] = sum(staleness_mean_gaps) / len(staleness_mean_gaps)
+            metrics["min_rollout_weight_staleness"] = min(staleness_min_gaps)
             metrics["max_rollout_weight_staleness"] = max(staleness_gaps)
     metrics["sample_keep_ratio"] = kept_samples / original_samples if original_samples else 0.0
     metrics["group_keep_ratio"] = len(kept_groups) / len(groups) if groups else 0.0

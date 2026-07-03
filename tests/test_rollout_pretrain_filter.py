@@ -30,6 +30,12 @@ def make_sample(index: int, *, response_length: int = 10, total_length: int = 20
     return sample
 
 
+def make_sample_with_versions(index: int, versions: list[str]):
+    sample = make_sample(index)
+    sample.weight_versions = versions
+    return sample
+
+
 @pytest.mark.unit
 def test_filter_groups_flat_samples_by_group_index_before_rollout_id():
     samples = [make_sample(i, weight_version="10") for i in range(5)]
@@ -112,9 +118,9 @@ def test_generate_requires_trainer_weight_version_when_staleness_enabled():
 
 
 @pytest.mark.unit
-def test_filter_relaxes_staleness_when_batch_mean_and_max_are_low():
-    group = [make_sample(i, weight_version="8") for i in range(4)]
-    group.append(make_sample(4, weight_version="6"))
+def test_filter_keeps_multi_version_sample_when_mean_and_max_staleness_are_within_policy():
+    group = [make_sample(i, weight_version="10") for i in range(4)]
+    group.append(make_sample_with_versions(4, ["6", "9"]))
 
     kept, metrics = _filter_rollout_groups_for_training(
         make_args(),
@@ -124,14 +130,14 @@ def test_filter_relaxes_staleness_when_batch_mean_and_max_are_low():
     )
 
     assert kept == [group]
-    assert metrics["effective_max_rollout_weight_staleness"] == 5
+    assert metrics["effective_max_rollout_weight_staleness"] == 6
     assert metrics["dropped_stale_samples"] == 0
 
 
 @pytest.mark.unit
-def test_filter_keeps_strict_cap_when_batch_max_staleness_is_high():
-    group = [make_sample(i, weight_version="8") for i in range(4)]
-    group.append(make_sample(4, weight_version="3"))
+def test_filter_drops_multi_version_sample_when_max_staleness_is_high():
+    group = [make_sample(i, weight_version="10") for i in range(4)]
+    group.append(make_sample_with_versions(4, ["3", "10", "10", "10"]))
 
     kept, metrics = _filter_rollout_groups_for_training(
         make_args(),
@@ -141,8 +147,25 @@ def test_filter_keeps_strict_cap_when_batch_max_staleness_is_high():
     )
 
     assert kept == [group[:4]]
-    assert metrics["effective_max_rollout_weight_staleness"] == 3
+    assert metrics["effective_max_rollout_weight_staleness"] == 6
     assert metrics["dropped_stale_samples"] == 1
+
+
+@pytest.mark.unit
+def test_filter_drops_reward_timeout_sample_before_training():
+    group = [make_sample(i, weight_version="10") for i in range(5)]
+    group[0].reward = {"score": 0.0, "timeout": True, "failure_type": "timeout"}
+
+    kept, metrics = _filter_rollout_groups_for_training(
+        make_args(),
+        [group],
+        trainer_weight_version=10,
+        train_parallel_config={"cp_size": 1},
+    )
+
+    assert kept == [group[1:]]
+    assert metrics["dropped_reward_timeout_samples"] == 1
+    assert metrics["kept_samples"] == 4
 
 
 @pytest.mark.unit

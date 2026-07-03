@@ -10,6 +10,7 @@ from slime.utils.rollout_staleness import (
     min_rollout_weight_version,
     raise_on_stale_rollout_samples,
     resolve_effective_max_staleness,
+    rollout_weight_staleness_gaps,
     rollout_weight_staleness,
     rollout_weight_staleness_stats_for_training,
 )
@@ -25,20 +26,20 @@ def test_rollout_weight_staleness():
     assert rollout_weight_staleness(10, ["7", "9"]) == 3
 
 
-def test_resolve_effective_max_staleness_relaxes_when_batch_is_uniformly_fresh():
-    assert resolve_effective_max_staleness(3, [2, 2, 2, 4]) == 5
+def test_rollout_weight_staleness_gaps_tracks_min_mean_max():
+    gaps = rollout_weight_staleness_gaps(10, ["6", "9"])
+
+    assert gaps is not None
+    assert gaps.min == 1
+    assert gaps.mean == pytest.approx(2.5)
+    assert gaps.max == 4
 
 
-def test_resolve_effective_max_staleness_stays_strict_when_batch_max_is_high():
-    assert resolve_effective_max_staleness(3, [2, 2, 2, 7]) == 3
+def test_resolve_effective_max_staleness_uses_policy_max_gap():
+    assert resolve_effective_max_staleness(3, [2, 2, 2, 4]) == 6
 
 
-def test_resolve_effective_max_staleness_stays_strict_for_pathological_gap():
-    assert resolve_effective_max_staleness(3, [2, 2, 40]) == 3
-
-
-def test_resolve_effective_max_staleness_without_gaps_returns_base():
-    assert resolve_effective_max_staleness(3, []) == 3
+def test_resolve_effective_max_staleness_without_cap_returns_none():
     assert resolve_effective_max_staleness(None, [1, 2]) is None
 
 

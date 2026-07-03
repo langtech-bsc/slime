@@ -13,10 +13,8 @@ from slime.utils import logging_utils
 
 logger = logging.getLogger(__name__)
 
-# Batch-level thresholds for relaxing the staleness cap when the rollout batch is uniformly fresh.
-STALENESS_RELAX_MEAN_THRESHOLD = 3
-STALENESS_RELAX_MAX_THRESHOLD = 6
-STALENESS_RELAXED_MAX_STALENESS = 5
+# Oldest-version cap for trajectories generated across multiple weight versions.
+STALENESS_MAX_OLDEST_THRESHOLD = 6
 
 
 @dataclass(frozen=True)
@@ -24,6 +22,13 @@ class RolloutWeightStalenessStats:
     mean: float | None
     median: float | None
     p95: float | None
+
+
+@dataclass(frozen=True)
+class RolloutWeightStalenessGaps:
+    min: int
+    mean: float
+    max: int
 
 
 @dataclass(frozen=True)
@@ -58,16 +63,33 @@ def min_rollout_weight_version(weight_versions: list[str] | None) -> int | None:
     return min(parsed)
 
 
-def rollout_weight_staleness(trainer_weight_version: int, weight_versions: list[str] | None) -> int | None:
-    """Trainer minus rollout weight version, or None when rollout version is unknown."""
-    rollout_version = min_rollout_weight_version(weight_versions)
-    if rollout_version is None:
+def rollout_weight_staleness_gaps(
+    trainer_weight_version: int, weight_versions: list[str] | None
+) -> RolloutWeightStalenessGaps | None:
+    """Return min/mean/max trainer-minus-rollout gaps for known sample versions."""
+    if not weight_versions:
         return None
-    return trainer_weight_version - rollout_version
+    gaps: list[int] = []
+    for version in weight_versions:
+        try:
+            gaps.append(trainer_weight_version - int(version))
+        except (TypeError, ValueError):
+            continue
+    if not gaps:
+        return None
+    return RolloutWeightStalenessGaps(min=min(gaps), mean=sum(gaps) / len(gaps), max=max(gaps))
+
+
+def rollout_weight_staleness(trainer_weight_version: int, weight_versions: list[str] | None) -> int | None:
+    """Maximum trainer-minus-rollout gap, or None when rollout version is unknown."""
+    gaps = rollout_weight_staleness_gaps(trainer_weight_version, weight_versions)
+    if gaps is None:
+        return None
+    return gaps.max
 
 
 def compute_rollout_staleness_gaps(samples, trainer_weight_version: int) -> list[int]:
-    """Return per-sample trainer-minus-rollout gaps for samples with known versions."""
+    """Return per-sample maximum trainer-minus-rollout gaps for samples with known versions."""
     gaps: list[int] = []
     for sample in samples:
         gap = rollout_weight_staleness(trainer_weight_version, sample.weight_versions)
@@ -77,16 +99,10 @@ def compute_rollout_staleness_gaps(samples, trainer_weight_version: int) -> list
 
 
 def resolve_effective_max_staleness(base: int | None, gaps: list[int]) -> int | None:
-    """Pick the staleness cap used for pre-training filtering and actor guard."""
+    """Pick the actor-side maximum staleness cap used after pre-training filtering."""
     if base is None:
         return None
-    if not gaps:
-        return base
-    mean_gap = sum(gaps) / len(gaps)
-    max_gap = max(gaps)
-    if mean_gap < STALENESS_RELAX_MEAN_THRESHOLD and max_gap < STALENESS_RELAX_MAX_THRESHOLD:
-        return max(base, STALENESS_RELAXED_MAX_STALENESS)
-    return base
+    return max(base, STALENESS_MAX_OLDEST_THRESHOLD)
 
 
 def discard_stale_rollout_samples(

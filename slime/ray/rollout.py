@@ -27,6 +27,10 @@ from slime.utils.logging_utils import configure_logger, init_tracking
 from slime.utils.metric_utils import compute_pass_rate, compute_rollout_step, compute_statistics, dict_add_prefix
 from slime.utils.misc import Box, group_by, load_function
 from slime.utils.rollout_dump_utils import AsyncRolloutDumper, RolloutDumpJob, load_rollout_dump, resolve_rollout_dump_load_path
+from slime.utils.degeneration import (
+    degeneration_signal_from_metadata,
+    detect_degenerate_response,
+)
 from slime.utils.rollout_staleness import (
     compute_rollout_staleness_gaps,
     resolve_effective_max_staleness,
@@ -1581,6 +1585,7 @@ def _log_rollout_data(rollout_id, args, samples, rollout_extra_metrics, rollout_
 
 def compute_metrics_from_samples(args, samples):
     response_lengths = [sample.effective_response_length for sample in samples]
+    degeneration_signals = [_degeneration_signal_for_sample(sample) for sample in samples]
 
     log_dict = {}
     log_dict |= dict_add_prefix(compute_statistics(response_lengths), "response_len/")
@@ -1590,8 +1595,22 @@ def compute_metrics_from_samples(args, samples):
     log_dict |= _compute_reward_cat_metrics(args, samples)
     log_dict |= _compute_top_p_kept_vocab_metrics(args, samples)
     log_dict["repetition_frac"] = np.mean([int(has_repetition(s.response)) for s in samples]).item()
+    log_dict["degeneration_frac"] = np.mean([int(signal.detected) for signal in degeneration_signals]).item()
+    log_dict["degeneration_fence_frac"] = np.mean(
+        [int(signal.reason == "trailing_fence") for signal in degeneration_signals]
+    ).item()
+    log_dict["degeneration_repeated_line_frac"] = np.mean(
+        [int(signal.reason == "repeated_tail_line") for signal in degeneration_signals]
+    ).item()
+    log_dict["degeneration_char_loop_frac"] = np.mean(
+        [int(signal.reason in {"top_char_fraction", "max_char_run"}) for signal in degeneration_signals]
+    ).item()
     log_dict["truncated_ratio"] = np.mean([int(s.status == Sample.Status.TRUNCATED) for s in samples]).item()
     return log_dict
+
+
+def _degeneration_signal_for_sample(sample: Sample):
+    return degeneration_signal_from_metadata(sample.metadata) or detect_degenerate_response(sample.response)
 
 
 def compute_perf_metrics_from_samples(args, samples, rollout_time):

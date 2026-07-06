@@ -31,6 +31,7 @@ from typing import Any
 
 from slime.rollout.sglang_rollout import GenerateState, _prepare_prompt_ids, clamp_sampling_params_for_sample
 from slime.utils import http_utils
+from slime.utils.degeneration import detect_degenerate_response, mark_degenerate_response
 from slime.utils.processing_utils import encode_image_for_rollout_engine
 from slime.utils.trace_utils import build_sglang_meta_trace_attrs, trace_span
 from slime.utils.types import Sample
@@ -158,6 +159,14 @@ async def generate_streaming(args: Namespace, sample: Sample, sampling_params: d
                     text=call_text,
                     update_terminal_info=bool(meta.get("finish_reason")),
                 )
+
+                if getattr(args, "rollout_degeneration_detection_enable", False):
+                    signal = detect_degenerate_response(sample.response)
+                    if signal.detected:
+                        mark_degenerate_response(sample.metadata, signal)
+                        if getattr(args, "rollout_degeneration_stop_enable", False):
+                            sample.status = Sample.Status.TRUNCATED
+                            break
 
                 if state.aborted:
                     break

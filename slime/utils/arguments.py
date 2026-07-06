@@ -413,6 +413,24 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--rollout-degeneration-detection-enable",
+                action="store_true",
+                default=False,
+                help="Detect repetitive degenerate rollout responses and annotate sample metadata.",
+            )
+            parser.add_argument(
+                "--rollout-degeneration-stop-enable",
+                action="store_true",
+                default=False,
+                help="Stop streaming rollout generation client-side when degeneration is detected.",
+            )
+            parser.add_argument(
+                "--rollout-degeneration-penalty",
+                type=float,
+                default=0.5,
+                help="Reward penalty subtracted from samples marked as degenerate after normal scoring.",
+            )
+            parser.add_argument(
                 "--rollout-skip-special-tokens",
                 action="store_true",
                 default=False,

@@ -294,6 +294,9 @@ def log_rollout_data(
                 "weight_versions",
                 "metadata",
                 "prompt",
+                "label",
+                "response",
+                "opd_teacher_hidden_states",
             ]:
                 continue
             # Emit (sum, count) so gather_log_data can do a weighted average across

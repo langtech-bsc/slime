@@ -1,14 +1,17 @@
 import logging
 import os
 import random
+import time
 from argparse import Namespace
 from contextlib import nullcontext
 from pathlib import Path
+from types import SimpleNamespace
 
 import ray
 import torch
 import torch.distributed as dist
 from megatron.core import mpu
+from megatron.core import tensor_parallel as mcore_tensor_parallel
 from torch_memory_saver import torch_memory_saver
 from transformers import AutoConfig
 
@@ -20,6 +23,7 @@ from slime.utils.distributed_utils import get_gloo_group
 from slime.utils.logging_utils import init_tracking
 from slime.utils.memory_utils import clear_memory, print_memory
 from slime.utils.misc import Box
+from slime.utils.opd import OpdHiddenStateBuffer, OpdHiddenStatePayload
 from slime.utils.reloadable_process_group import destroy_process_groups, monkey_patch_torch_dist, reload_process_groups
 from slime.utils.rollout_staleness import log_rollout_weight_staleness_metrics, raise_on_stale_rollout_samples
 from slime.utils.routing_replay import RoutingReplay
@@ -85,6 +89,14 @@ class MegatronTrainRayActor(TrainRayActor):
         self.model, self.optimizer, self.opt_param_scheduler, loaded_rollout_id = initialize_model_and_optimizer(
             args, role
         )
+
+        if role == "opd_teacher":
+            self._opd_hidden_buffer = OpdHiddenStateBuffer(args.opd_hidden_cache_max_pending_batches)
+            self._opd_lm_head_patches = self._patch_opd_output_layers()
+            self.optimizer = None
+            self.opt_param_scheduler = None
+            clear_memory()
+            return loaded_rollout_id + 1
 
         vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size() or 1
         if vpp_size > 1:
@@ -186,6 +198,276 @@ class MegatronTrainRayActor(TrainRayActor):
         self.prof.on_init_end()
 
         return start_rollout_id
+
+    @staticmethod
+    def _unwrap_model_chunk(model_chunk):
+        while hasattr(model_chunk, "module"):
+            model_chunk = model_chunk.module
+        if hasattr(model_chunk, "language_model"):
+            model_chunk = model_chunk.language_model
+        return model_chunk
+
+    def _iter_opd_output_layers(self):
+        for model_chunk in self.model:
+            model = self._unwrap_model_chunk(model_chunk)
+            output_layer = getattr(model, "output_layer", None)
+            if output_layer is not None and getattr(model, "post_process", True):
+                yield model, output_layer
+
+    def _patch_opd_output_layers(self):
+        patches = []
+        for _model, output_layer in self._iter_opd_output_layers():
+            old_forward = output_layer.forward
+
+            def return_hidden(hidden_states, *args, _layer=output_layer, **kwargs):
+                if getattr(_layer, "sequence_parallel", False):
+                    hidden_states = mcore_tensor_parallel.gather_from_sequence_parallel_region(
+                        hidden_states,
+                        tensor_parallel_output_grad=False,
+                    )
+                return hidden_states, None
+
+            output_layer.forward = return_hidden
+            patches.append((output_layer, old_forward))
+        if not patches:
+            raise RuntimeError("OPD requires an output layer on the final pipeline stage")
+        return patches
+
+    @staticmethod
+    def _restore_opd_output_layers(patches):
+        for output_layer, old_forward in patches:
+            output_layer.forward = old_forward
+
+    def get_opd_teacher_head(self):
+        if self.role != "opd_teacher":
+            raise RuntimeError("get_opd_teacher_head is only valid on OPD teacher workers")
+        for model, output_layer in self._iter_opd_output_layers():
+            weight = getattr(output_layer, "weight", None)
+            if weight is None and hasattr(model, "shared_embedding_or_output_weight"):
+                weight = model.shared_embedding_or_output_weight()
+            if weight is not None:
+                return weight.detach().to("cpu")
+        return None
+
+    def set_opd_teacher_head(self, weight):
+        if weight is None:
+            self._opd_teacher_head = None
+            return False
+        output_layers = list(self._iter_opd_output_layers())
+        if len(output_layers) != 1:
+            raise RuntimeError("Asynchronous OPD currently requires one final output layer per actor worker")
+        student_head = output_layers[0][1].weight
+        if weight.shape != student_head.shape:
+            raise ValueError(f"OPD teacher/student output-head mismatch: {weight.shape} != {student_head.shape}")
+        self._opd_teacher_head = weight.to(
+            device=student_head.device,
+            dtype=student_head.dtype,
+            non_blocking=True,
+        )
+        self._opd_teacher_head.requires_grad_(False)
+        return True
+
+    def _build_opd_teacher_tokens(self, rollout_data):
+        if self.args.context_parallel_size != 1:
+            raise ValueError("Asynchronous OPD teacher currently requires context_parallel_size=1")
+        if self.args.opd_teacher_prompt_mode == "trajectory":
+            return rollout_data
+
+        from slime.rollout.opd_prompt import build_teacher_prompt
+
+        rebuilt_tokens = []
+        for prompt, label, response, tokens, response_length in zip(
+            rollout_data["prompt"],
+            rollout_data["label"],
+            rollout_data["response"],
+            rollout_data["tokens"],
+            rollout_data["response_lengths"],
+            strict=True,
+        ):
+            sample = SimpleNamespace(prompt=prompt, label=label, response=response)
+            teacher_prompt = build_teacher_prompt(self.args, sample)
+            if isinstance(teacher_prompt, list):
+                prefix = self.tokenizer.apply_chat_template(
+                    teacher_prompt,
+                    tokenize=True,
+                    add_generation_prompt=True,
+                )
+            else:
+                prefix = self.tokenizer(teacher_prompt, add_special_tokens=False)["input_ids"]
+            response_tokens = tokens[-response_length:].tolist()
+            rebuilt_tokens.append(torch.tensor(prefix + response_tokens, dtype=torch.long, device=tokens.device))
+        rollout_data["tokens"] = rebuilt_tokens
+        rollout_data["total_lengths"] = [len(tokens) for tokens in rebuilt_tokens]
+        self._reschedule_opd_teacher_batch(rollout_data)
+        return rollout_data
+
+    def _reschedule_opd_teacher_batch(self, rollout_data):
+        from slime.utils.dp_schedule import build_dp_schedule
+
+        vpp_size = mpu.get_virtual_pipeline_model_parallel_world_size() or 1
+        if vpp_size > 1:
+            from megatron.core.utils import get_model_config
+
+            microbatch_group_size = get_model_config(self.model[0]).microbatch_group_size_per_vp_stage
+        else:
+            microbatch_group_size = 1
+        train_parallel_config = {
+            "dp_size": 1,
+            "cp_size": 1,
+            "vpp_size": vpp_size,
+            "microbatch_group_size_per_vp_stage": microbatch_group_size,
+        }
+        partitions, microbatch_indices, num_microbatches, global_batch_sizes = build_dp_schedule(
+            self.args,
+            train_parallel_config,
+            rollout_data["total_lengths"],
+            global_batch_size=self.args.global_batch_size,
+            rollout_indices=rollout_data["rollout_ids"],
+        )
+        partition = partitions[0]
+        rollout_data["micro_batch_indices"] = [
+            [partition[local_index] for local_index in microbatch]
+            for microbatch in microbatch_indices[0]
+        ]
+        rollout_data["num_microbatches"] = num_microbatches
+        rollout_data["global_batch_sizes"] = global_batch_sizes
+
+    @staticmethod
+    def _collect_opd_hidden(
+        hidden,
+        *,
+        args,
+        unconcat_tokens,
+        total_lengths,
+        response_lengths,
+        with_entropy=False,
+        non_loss_data=True,
+    ):
+        del args, unconcat_tokens, with_entropy, non_loss_data
+        if hidden.ndim != 3 or hidden.size(0) != 1:
+            raise ValueError(f"Unexpected OPD hidden-state shape: {hidden.shape}")
+        hidden = hidden.squeeze(0)
+        result = []
+        offset = 0
+        for total_length, response_length in zip(total_lengths, response_lengths, strict=True):
+            end = offset + total_length
+            start = end - response_length
+            result.append(hidden[start - 1 : end - 1].detach())
+            offset = end
+        return {"hidden_states": result}
+
+    def cache_opd_hidden(self, rollout_id, rollout_data_ref, request_id):
+        if self.role != "opd_teacher":
+            raise RuntimeError("cache_opd_hidden is only valid on OPD teacher workers")
+        rollout_data = self._build_opd_teacher_tokens(self._get_rollout_data(rollout_data_ref))
+        iterator = get_data_iterator(rollout_data)
+        hidden = forward_only(
+            self._collect_opd_hidden,
+            self.args,
+            self.model,
+            iterator,
+            rollout_data["num_microbatches"],
+        ).get("hidden_states", [])
+        if dist.get_rank() != 0:
+            return {"request_id": request_id}
+        hidden_cpu = torch.nn.utils.rnn.pad_sequence(hidden, batch_first=True).to("cpu")
+        try:
+            hidden_cpu = hidden_cpu.pin_memory()
+        except RuntimeError:
+            pass
+        valid_mask = torch.zeros(hidden_cpu.shape[:2], dtype=torch.bool)
+        for row, response_length in enumerate(rollout_data["response_lengths"]):
+            valid_mask[row, :response_length] = True
+        payload = OpdHiddenStatePayload(
+            request_id=request_id,
+            hidden_states=hidden_cpu,
+            valid_mask=valid_mask,
+            created_at=time.time(),
+        )
+        self._opd_hidden_buffer.put(payload)
+        return {
+            **self._opd_hidden_buffer.metrics(),
+            "request_id": request_id,
+            "shape": tuple(hidden_cpu.shape),
+            "dtype": str(hidden_cpu.dtype).removeprefix("torch."),
+        }
+
+    def pop_opd_hidden(self, request_id):
+        if self.role != "opd_teacher":
+            raise RuntimeError("pop_opd_hidden is only valid on OPD teacher workers")
+        payload = self._opd_hidden_buffer.pop(request_id)
+        return {
+            "request_id": payload.request_id,
+            "hidden_states": payload.hidden_states,
+            "valid_mask": payload.valid_mask,
+            "metrics": self._opd_hidden_buffer.metrics(),
+        }
+
+    def discard_opd_hidden(self, request_id):
+        return self._opd_hidden_buffer.discard(request_id)
+
+    def create_opd_nccl_peer(self, host, port, side):
+        if dist.get_rank() != 0:
+            return False
+        from .opd_transport import stateless_init_process_group
+
+        self._opd_nccl = stateless_init_process_group(
+            host,
+            int(port),
+            rank=0 if side == "teacher" else 1,
+            world_size=2,
+            device=torch.cuda.current_device(),
+        )
+        return True
+
+    def get_opd_nccl_address(self):
+        return self._get_current_node_ip_and_free_port(start_port=22000)
+
+    def send_opd_hidden(self, request_id, chunk_rows):
+        if self.role != "opd_teacher":
+            raise RuntimeError("send_opd_hidden is only valid on OPD teacher workers")
+        if dist.get_rank() != 0:
+            return {}
+        from .opd_transport import broadcast_hidden_chunk
+
+        payload = self._opd_hidden_buffer.pop(request_id)
+        hidden = payload.hidden_states
+        chunks = 0
+        for start in range(0, hidden.size(0), chunk_rows):
+            staging = hidden[start : start + chunk_rows].to(
+                device=torch.cuda.current_device(),
+                non_blocking=True,
+            )
+            broadcast_hidden_chunk(staging, self._opd_nccl)
+            chunks += 1
+        return {**self._opd_hidden_buffer.metrics(), "opd/hidden_nccl_chunks": float(chunks)}
+
+    def recv_opd_hidden(self, metadata):
+        shape = tuple(int(dim) for dim in metadata["shape"])
+        dtype = getattr(torch, metadata["dtype"])
+        chunk_rows = int(self.args.opd_hidden_transfer_chunk_rows)
+        hidden = torch.empty(shape, dtype=dtype, device="cpu")
+        try:
+            hidden = hidden.pin_memory()
+        except RuntimeError:
+            pass
+        tp_group = mpu.get_tensor_model_parallel_group()
+        tp_src = mpu.get_tensor_model_parallel_src_rank()
+        from .opd_transport import broadcast_hidden_chunk
+
+        for start in range(0, shape[0], chunk_rows):
+            rows = min(chunk_rows, shape[0] - start)
+            staging = torch.empty(
+                (rows, *shape[1:]),
+                dtype=dtype,
+                device=torch.cuda.current_device(),
+            )
+            if dist.get_rank() == 0:
+                broadcast_hidden_chunk(staging, self._opd_nccl)
+            dist.broadcast(staging, src=tp_src, group=tp_group)
+            hidden[start : start + rows].copy_(staging, non_blocking=True)
+            torch.cuda.synchronize()
+        return hidden
 
     @timer
     def sleep(self) -> None:
@@ -479,6 +761,38 @@ class MegatronTrainRayActor(TrainRayActor):
         return {}
 
     def train_actor(self, rollout_id: int, rollout_data: RolloutBatch, external_data=None) -> None:
+        async_opd = self.args.use_opd and self.args.opd_type == "megatron_async"
+        opd_metrics = {}
+        if async_opd:
+            if external_data is None:
+                raise RuntimeError("Asynchronous OPD actor training requires a teacher hidden-state payload")
+            recv_started = time.time()
+            hidden_states = self.recv_opd_hidden(external_data)
+            opd_metrics = {
+                key: float(value)
+                for key, value in external_data.items()
+                if key.startswith("opd/") and isinstance(value, (int, float))
+            }
+            opd_metrics.update(
+                {
+                    "opd/hidden_nccl_recv_seconds": time.time() - recv_started,
+                    "opd/hidden_nccl_payload_gb": hidden_states.nbytes / (1024**3),
+                    "opd/hidden_nccl_chunks": float(
+                        (hidden_states.size(0) + self.args.opd_hidden_transfer_chunk_rows - 1)
+                        // self.args.opd_hidden_transfer_chunk_rows
+                    ),
+                }
+            )
+            if hidden_states.size(0) != len(rollout_data["tokens"]):
+                raise ValueError(
+                    "OPD teacher/actor local batch mismatch: "
+                    f"{hidden_states.size(0)} != {len(rollout_data['tokens'])}"
+                )
+            rollout_data["opd_teacher_hidden_states"] = [
+                hidden_states[row, :response_length]
+                for row, response_length in enumerate(rollout_data["response_lengths"])
+            ]
+
         # Create data iterator for log_probs and train.
         data_iterator = get_data_iterator(rollout_data)
         num_microbatches = rollout_data["num_microbatches"]
@@ -488,7 +802,7 @@ class MegatronTrainRayActor(TrainRayActor):
             self.fill_routing_replay(data_iterator, num_microbatches, rollout_data)
 
         with inverse_timer("train_wait"), timer("train"):
-            if self.args.compute_advantages_and_returns:
+            if self.args.compute_advantages_and_returns and not async_opd:
                 if "ref" in self.weights_backuper.backup_tags:
                     if self.args.use_routing_replay:
                         os.environ["ROUTING_REPLAY_STAGE"] = "fallthrough"
@@ -591,15 +905,51 @@ class MegatronTrainRayActor(TrainRayActor):
             if self.args.use_routing_replay:
                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
             with timer("actor_train"):
-                train(
-                    rollout_id,
-                    self.model,
-                    self.optimizer,
-                    self.opt_param_scheduler,
-                    data_iterator,
-                    num_microbatches,
-                    global_batch_sizes,
-                )
+                if async_opd:
+                    if getattr(self, "_opd_teacher_head", None) is None:
+                        raise RuntimeError("Asynchronous OPD teacher head was not initialized")
+                    output_layers = list(self._iter_opd_output_layers())
+                    if len(output_layers) != 1:
+                        raise RuntimeError(
+                            "Asynchronous OPD currently requires one final output layer per worker"
+                        )
+                    _model, output_layer = output_layers[0]
+                    student_head = output_layer.weight
+                    teacher_head = self._opd_teacher_head
+                    if teacher_head.shape != student_head.shape:
+                        raise ValueError(
+                            f"OPD teacher/student output-head mismatch: {teacher_head.shape} != {student_head.shape}"
+                        )
+                    patches = self._patch_opd_output_layers()
+                    old_loss_type = self.args.loss_type
+                    self.args.loss_type = "opd_distillation_loss"
+                    self.args._opd_student_head = student_head
+                    self.args._opd_teacher_head = teacher_head
+                    try:
+                        train(
+                            rollout_id,
+                            self.model,
+                            self.optimizer,
+                            self.opt_param_scheduler,
+                            data_iterator,
+                            num_microbatches,
+                            global_batch_sizes,
+                        )
+                    finally:
+                        self._restore_opd_output_layers(patches)
+                        self.args.loss_type = old_loss_type
+                        self.args._opd_student_head = None
+                        self.args._opd_teacher_head = None
+                else:
+                    train(
+                        rollout_id,
+                        self.model,
+                        self.optimizer,
+                        self.opt_param_scheduler,
+                        data_iterator,
+                        num_microbatches,
+                        global_batch_sizes,
+                    )
 
             self.prof.step(rollout_id=rollout_id)
 
@@ -622,7 +972,9 @@ class MegatronTrainRayActor(TrainRayActor):
                     logger.info(f"Updating ref model at rollout_id {rollout_id}")
                 self.weights_backuper.backup("ref")
 
-        log_perf_data(rollout_id, self.args, extra_metrics=self.weight_updater.pop_metrics())
+        perf_metrics = self.weight_updater.pop_metrics()
+        perf_metrics.update(opd_metrics)
+        log_perf_data(rollout_id, self.args, extra_metrics=perf_metrics)
 
     @timer
     def save_model(self, rollout_id: int, force_sync: bool = False) -> None:

@@ -121,20 +121,94 @@ def create_placement_groups(args):
     """Create placement groups for actor, critic, and rollout engines."""
 
     num_gpus, rollout_offset = _get_placement_group_layout(args)
+    teacher_offset = num_gpus
+    teacher_gpus = 0
+    if args.use_opd and args.opd_type == "megatron_async":
+        teacher_gpus = args.opd_teacher_num_nodes * args.opd_teacher_num_gpus_per_node
+        num_gpus += teacher_gpus
 
     logger.info(f"Creating placement group with {num_gpus} GPUs...")
     pg, actor_pg_reordered_bundle_indices, actor_pg_reordered_gpu_ids = _create_placement_group(num_gpus)
-    rollout_pg_reordered_bundle_indices = actor_pg_reordered_bundle_indices[rollout_offset:]
-    rollout_pg_reordered_gpu_ids = actor_pg_reordered_gpu_ids[rollout_offset:]
+    actor_gpus = args.actor_num_nodes * args.actor_num_gpus_per_node
+    actor_pg_bundle_indices = actor_pg_reordered_bundle_indices[:actor_gpus]
+    actor_pg_gpu_ids = actor_pg_reordered_gpu_ids[:actor_gpus]
+    rollout_pg_reordered_bundle_indices = actor_pg_reordered_bundle_indices[rollout_offset:teacher_offset]
+    rollout_pg_reordered_gpu_ids = actor_pg_reordered_gpu_ids[rollout_offset:teacher_offset]
 
     result = {
-        "actor": (pg, actor_pg_reordered_bundle_indices, actor_pg_reordered_gpu_ids),
+        "actor": (pg, actor_pg_bundle_indices, actor_pg_gpu_ids),
         "rollout": (pg, rollout_pg_reordered_bundle_indices, rollout_pg_reordered_gpu_ids),
     }
+    result["opd_teacher"] = (
+        (
+            pg,
+            actor_pg_reordered_bundle_indices[teacher_offset : teacher_offset + teacher_gpus],
+            actor_pg_reordered_gpu_ids[teacher_offset : teacher_offset + teacher_gpus],
+        )
+        if teacher_gpus
+        else None
+    )
 
     result["critic"] = result["actor"] if args.use_critic else None
 
     return result
+
+
+def create_opd_teacher_model(args, pgs):
+    if not (args.use_opd and args.opd_type == "megatron_async"):
+        return None
+    teacher_args = copy.deepcopy(args)
+    if args.opd_teacher_megatron_config_path is not None:
+        from slime.utils.arguments import parse_megatron_role_args
+
+        teacher_args = parse_megatron_role_args(
+            args,
+            args.opd_teacher_megatron_config_path,
+            role="opd_teacher",
+        )
+    else:
+        teacher_args.load = args.opd_teacher_load
+        teacher_args.use_opd = False
+        teacher_args.use_critic = False
+        teacher_args.kl_coef = 0
+        teacher_args.use_kl_loss = False
+        teacher_args.entropy_coef = 0
+        teacher_args.no_load_optim = True
+        teacher_args.no_load_rng = True
+
+    actor_world = args.actor_num_nodes * args.actor_num_gpus_per_node
+    teacher_world = args.opd_teacher_num_nodes * args.opd_teacher_num_gpus_per_node
+    if actor_world != teacher_world:
+        raise ValueError(
+            "Asynchronous OPD currently requires rank-aligned actor and teacher groups: "
+            f"actor_world={actor_world}, teacher_world={teacher_world}"
+        )
+    expected_world = args.tensor_model_parallel_size * args.pipeline_model_parallel_size
+    if actor_world != expected_world or args.pipeline_model_parallel_size != 1:
+        raise ValueError(
+            "Asynchronous OPD currently requires one data-parallel replica and pipeline parallel size 1: "
+            f"actor_world={actor_world}, tp*pp={expected_world}, pp={args.pipeline_model_parallel_size}"
+        )
+    for field in (
+        "tensor_model_parallel_size",
+        "pipeline_model_parallel_size",
+        "context_parallel_size",
+    ):
+        if getattr(args, field) != getattr(teacher_args, field):
+            raise ValueError(
+                f"Asynchronous OPD requires matching actor/teacher {field}: "
+                f"{getattr(args, field)} != {getattr(teacher_args, field)}"
+            )
+
+    teacher_model = allocate_train_group(
+        args=teacher_args,
+        num_nodes=args.opd_teacher_num_nodes,
+        num_gpus_per_node=args.opd_teacher_num_gpus_per_node,
+        pg=pgs["opd_teacher"],
+        role="opd_teacher",
+    )
+    ray.get(teacher_model.async_init(teacher_args, role="opd_teacher"))
+    return teacher_model
 
 
 def allocate_train_group(args, num_nodes, num_gpus_per_node, pg, role="actor"):

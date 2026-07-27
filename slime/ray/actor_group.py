@@ -143,6 +143,46 @@ class RayTrainGroup:
             for actor in self._actor_handlers
         ]
 
+    def async_cache_opd_hidden(self, rollout_id, rollout_data_ref, request_id):
+        return [
+            actor.cache_opd_hidden.remote(rollout_id, rollout_data_ref, request_id)
+            for actor in self._actor_handlers
+        ]
+
+    def async_pop_opd_hidden(self, request_id):
+        return [actor.pop_opd_hidden.remote(request_id) for actor in self._actor_handlers]
+
+    def async_send_opd_hidden(self, request_id, chunk_rows):
+        return [actor.send_opd_hidden.remote(request_id, chunk_rows) for actor in self._actor_handlers]
+
+    def discard_opd_hidden(self, request_id):
+        return [actor.discard_opd_hidden.remote(request_id) for actor in self._actor_handlers]
+
+    def get_opd_teacher_heads(self):
+        return [actor.get_opd_teacher_head.remote() for actor in self._actor_handlers]
+
+    def set_opd_teacher_heads(self, heads):
+        if len(heads) != len(self._actor_handlers):
+            raise ValueError("OPD teacher and actor worker counts must match")
+        return ray.get(
+            [
+                actor.set_opd_teacher_head.remote(head)
+                for actor, head in zip(self._actor_handlers, heads, strict=True)
+            ]
+        )
+
+    def init_opd_nccl_peer(self, peer_group):
+        host, port = ray.get(self._actor_handlers[0].get_opd_nccl_address.remote())
+        teacher_refs = [
+            actor.create_opd_nccl_peer.remote(host, port, "teacher")
+            for actor in self._actor_handlers
+        ]
+        actor_refs = [
+            actor.create_opd_nccl_peer.remote(host, port, "actor")
+            for actor in peer_group._actor_handlers
+        ]
+        return ray.get([*teacher_refs, *actor_refs])
+
     def save_model(self, rollout_id, force_sync=False):
         """Save actor model"""
         return ray.get([actor.save_model.remote(rollout_id, force_sync=force_sync) for actor in self._actor_handlers])

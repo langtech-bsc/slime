@@ -2,7 +2,12 @@ import os
 
 import ray
 
-from slime.ray.placement_group import create_placement_groups, create_rollout_manager, create_training_models
+from slime.ray.placement_group import (
+    create_opd_teacher_model,
+    create_placement_groups,
+    create_rollout_manager,
+    create_training_models,
+)
 from slime.ray.utils import add_default_ray_env_vars
 from slime.utils.arguments import parse_args
 from slime.utils.logging_utils import configure_logger, finish_tracking, init_tracking
@@ -35,12 +40,27 @@ def train(args):
 
     # create the actor and critic models
     actor_model, critic_model = create_training_models(args, pgs, rollout_manager)
+    opd_teacher_model = create_opd_teacher_model(args, pgs)
 
     # Always push actor weights to rollout once weights are loaded.
     actor_model.update_weights()
 
     if args.check_weight_update_equal:
         ray.get(rollout_manager.check_weights.remote(action="compare"))
+
+    if opd_teacher_model is not None:
+        from slime.ray.opd_async import train_async_opd
+
+        train_async_opd(
+            args,
+            rollout_manager,
+            actor_model,
+            opd_teacher_model,
+            num_rollout_per_epoch,
+        )
+        ray.get(rollout_manager.dispose.remote())
+        finish_tracking(args)
+        return
 
     # async train loop.
     rollout_data_next_future = rollout_manager.collect_rollout_samples.remote(args.start_rollout_id)

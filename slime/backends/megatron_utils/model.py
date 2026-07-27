@@ -201,7 +201,7 @@ def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer)
 def setup_model_and_optimizer(
     args: Namespace,
     role: str = "actor",
-) -> tuple[list[DDP], MegatronOptimizer, OptimizerParamScheduler]:
+) -> tuple[list[DDP], MegatronOptimizer | None, OptimizerParamScheduler | None]:
     """Build model(s), wrap with DDP, and construct optimizer and scheduler.
 
     Args:
@@ -222,7 +222,15 @@ def setup_model_and_optimizer(
     assert not args.moe_use_upcycling
     assert args.load is not None or args.pretrained_checkpoint is not None
 
-    model = get_model(get_model_provider_func(args, role), ModelType.encoder_or_decoder)
+    model = get_model(
+        get_model_provider_func(args, role),
+        ModelType.encoder_or_decoder,
+        wrap_with_ddp=role != "opd_teacher",
+    )
+    if role == "opd_teacher":
+        for model_chunk in model:
+            model_chunk.requires_grad_(False)
+        return model, None, None
 
     # Optimizer
     kwargs = {}
@@ -515,6 +523,7 @@ def train_one_step(
                     "returns",
                     "rollout_log_probs",
                     "teacher_log_probs",
+                    "opd_teacher_hidden_states",
                     "rollout_mask_sums",
                 ],
             ),
@@ -952,7 +961,7 @@ def save(
 
 def initialize_model_and_optimizer(
     args: Namespace, role: str = "actor"
-) -> tuple[list[DDP], MegatronOptimizer, OptimizerParamScheduler, int]:
+) -> tuple[list[DDP], MegatronOptimizer | None, OptimizerParamScheduler | None, int]:
     """Initialize model(s), optimizer, scheduler, and load from checkpoint.
 
     Args:

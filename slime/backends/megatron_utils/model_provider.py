@@ -57,7 +57,7 @@ class LinearForLastLayer(torch.nn.Linear):
 
 def _get_model_provider_func(
     args: argparse.Namespace,
-    role: Literal["actor", "critic"] = "actor",
+    role: Literal["actor", "critic", "opd_teacher"] = "actor",
 ):
     # Support custom model provider path (similar to --custom-rm-path for reward models)
     if getattr(args, "custom_model_provider_path", None):

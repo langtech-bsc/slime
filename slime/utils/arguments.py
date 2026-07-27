@@ -1179,12 +1179,13 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--opd-type",
                 type=str,
-                choices=["sglang", "megatron"],
+                choices=["sglang", "megatron", "megatron_async"],
                 default=None,
                 help=(
                     "Type of on-policy distillation. "
                     "'sglang': Teacher log-probs are obtained from external SGLang server during rollout. "
-                    "'megatron': Teacher model is loaded via --opd-teacher-load and forwarded during training."
+                    "'megatron': Teacher model is loaded via --opd-teacher-load and forwarded during training. "
+                    "'megatron_async': A separate Megatron teacher returns hidden states to the trainer."
                 ),
             )
             parser.add_argument(
@@ -1205,6 +1206,46 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--opd-teacher-ckpt-step", type=int, default=None, help="The checkpoint step for OPD teacher model."
             )
+            parser.add_argument(
+                "--opd-kl-direction",
+                choices=["forward", "reverse"],
+                default="forward",
+                help="KL direction for pure asynchronous OPD. Reverse KL is normalized on teacher top-k support.",
+            )
+            parser.add_argument("--opd-top-k", type=int, default=2048)
+            parser.add_argument("--opd-temperature", type=float, default=1.0)
+            parser.add_argument("--opd-pointwise-clip", type=float, default=0.05)
+            parser.add_argument(
+                "--opd-normalize-topk",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+            )
+            parser.add_argument("--opd-teacher-num-nodes", type=int, default=1)
+            parser.add_argument("--opd-teacher-num-gpus-per-node", type=int, default=4)
+            parser.add_argument("--opd-teacher-megatron-config-path", type=str, default=None)
+            parser.add_argument(
+                "--opd-teacher-prompt-mode",
+                choices=["trajectory", "custom"],
+                default="trajectory",
+            )
+            parser.add_argument("--opd-teacher-prompt-function-path", type=str, default=None)
+            parser.add_argument("--opd-hidden-cache-max-pending-batches", type=int, default=2)
+            parser.add_argument(
+                "--opd-hidden-transfer-chunk-rows",
+                type=int,
+                default=1,
+                help="Number of padded batch rows per staged hidden-state NCCL transfer.",
+            )
+            parser.add_argument("--opd-hidden-projection-chunk-tokens", type=int, default=1024)
+            parser.add_argument("--opd-vocab-chunk-size", type=int, default=4096)
+            parser.add_argument(
+                "--opd-pipeline-depth",
+                type=int,
+                choices=[1, 2],
+                default=2,
+                help="Use 1 for serialized teacher scoring or 2 for one-batch teacher prefetch.",
+            )
+            parser.add_argument("--opd-stage-timeout-seconds", type=float, default=900.0)
             return parser
 
         # wandb
@@ -1695,6 +1736,17 @@ def _apply_megatron_role_overrides(base_args, overrides, role):
         role_args.untie_embeddings_and_output_weights = True
         if "disable_param_buffers_cpu_backup" not in overrides:
             role_args.disable_param_buffers_cpu_backup = False
+    elif role == "opd_teacher":
+        role_args.load = role_args.opd_teacher_load
+        role_args.use_opd = False
+        role_args.use_critic = False
+        role_args.kl_coef = 0
+        role_args.use_kl_loss = False
+        role_args.entropy_coef = 0
+        role_args.custom_advantage_function_path = None
+        role_args.disable_param_buffers_cpu_backup = True
+        role_args.no_load_optim = True
+        role_args.no_load_rng = True
 
     return role_args
 
@@ -1705,7 +1757,7 @@ def parse_megatron_role_args(base_args, megatron_config_path, role):
     The config must contain a top-level ``megatron`` list with per-role entries.
     Missing roles inherit the base args unchanged.
     """
-    assert role in {"actor", "critic"}, f"Unsupported Megatron config role: {role}"
+    assert role in {"actor", "critic", "opd_teacher"}, f"Unsupported Megatron config role: {role}"
 
     with open(megatron_config_path) as f:
         raw_config = yaml.safe_load(f) or {}
@@ -1857,12 +1909,15 @@ def slime_validate_args(args):
     # Validate on-policy distillation (OPD) arguments
     if args.use_opd:
         if args.opd_type is None:
-            raise ValueError("--opd-type must be specified when --use-opd is enabled. Choose 'sglang' or 'megatron'.")
+            raise ValueError(
+                "--opd-type must be specified when --use-opd is enabled. "
+                "Choose 'sglang', 'megatron', or 'megatron_async'."
+            )
 
-        if args.opd_type == "megatron":
+        if args.opd_type in {"megatron", "megatron_async"}:
             if args.opd_teacher_load is None:
                 raise ValueError(
-                    "--opd-teacher-load is required when --opd-type=megatron. "
+                    "--opd-teacher-load is required when using a Megatron OPD teacher. "
                     "Please provide the path to the teacher model checkpoint."
                 )
             if not os.path.exists(args.opd_teacher_load):
@@ -1874,6 +1929,49 @@ def slime_validate_args(args):
                     f"opd_teacher_load {args.opd_teacher_load} does not have latest_checkpointed_iteration.txt, "
                     "please make sure it is a valid megatron checkpoint directory."
                 )
+
+            if args.opd_type == "megatron_async":
+                positive_int_fields = (
+                    "opd_top_k",
+                    "opd_teacher_num_nodes",
+                    "opd_teacher_num_gpus_per_node",
+                    "opd_hidden_cache_max_pending_batches",
+                    "opd_hidden_transfer_chunk_rows",
+                    "opd_hidden_projection_chunk_tokens",
+                    "opd_vocab_chunk_size",
+                    "opd_pipeline_depth",
+                )
+                for field in positive_int_fields:
+                    if int(getattr(args, field)) <= 0:
+                        raise ValueError(f"--{field.replace('_', '-')} must be positive")
+                if args.opd_temperature <= 0:
+                    raise ValueError("--opd-temperature must be positive")
+                if args.opd_stage_timeout_seconds <= 0:
+                    raise ValueError("--opd-stage-timeout-seconds must be positive")
+                if args.opd_pointwise_clip < 0:
+                    raise ValueError("--opd-pointwise-clip must be non-negative")
+                if args.opd_pipeline_depth > args.opd_hidden_cache_max_pending_batches:
+                    raise ValueError(
+                        "--opd-pipeline-depth cannot exceed --opd-hidden-cache-max-pending-batches"
+                    )
+                if args.opd_pipeline_depth not in {1, 2}:
+                    raise ValueError("--opd-pipeline-depth must be 1 or 2")
+                if args.n_samples_per_prompt != 1:
+                    raise ValueError("--opd-type=megatron_async requires --n-samples-per-prompt=1")
+                if args.use_critic:
+                    raise ValueError("--opd-type=megatron_async does not support a critic")
+                if args.entropy_coef != 0:
+                    raise ValueError("--opd-type=megatron_async requires --entropy-coef=0")
+                if args.context_parallel_size != 1:
+                    raise ValueError("--opd-type=megatron_async currently requires --context-parallel-size=1")
+                if args.pipeline_model_parallel_size != 1:
+                    raise ValueError(
+                        "--opd-type=megatron_async currently requires --pipeline-model-parallel-size=1"
+                    )
+                if args.opd_teacher_prompt_mode == "custom" and not args.opd_teacher_prompt_function_path:
+                    raise ValueError(
+                        "--opd-teacher-prompt-mode=custom requires --opd-teacher-prompt-function-path"
+                    )
 
         elif args.opd_type == "sglang":
             if args.opd_teacher_load is not None:

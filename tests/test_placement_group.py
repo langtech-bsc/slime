@@ -8,7 +8,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from slime.ray.placement_group import _create_placement_group, _get_placement_group_layout
+from slime.ray.placement_group import _create_placement_group, _get_placement_group_layout, create_placement_groups
 
 NUM_GPUS = 0
 
@@ -22,6 +22,7 @@ def _args(**overrides):
         "debug_rollout_only": False,
         "colocate": False,
         "rollout_external": False,
+        "use_critic": False,
     }
     values.update(overrides)
     return Namespace(**values)
@@ -48,6 +49,27 @@ def test_placement_group_layout(overrides, expected):
 
 def test_create_zero_gpu_placement_group_is_empty():
     assert _create_placement_group(0) == (None, [], [])
+
+
+def test_async_opd_reserves_disjoint_teacher_bundles(monkeypatch):
+    args = _args(
+        actor_num_nodes=1,
+        actor_num_gpus_per_node=4,
+        rollout_num_gpus=12,
+        use_opd=True,
+        opd_type="megatron_async",
+        opd_teacher_num_nodes=1,
+        opd_teacher_num_gpus_per_node=4,
+    )
+    monkeypatch.setattr(
+        "slime.ray.placement_group._create_placement_group",
+        lambda count: ("pg", list(range(count)), list(range(count))),
+    )
+
+    groups = create_placement_groups(args)
+
+    assert groups["rollout"][1][:12] == list(range(4, 16))
+    assert groups["opd_teacher"][1] == list(range(16, 20))
 
 
 if __name__ == "__main__":

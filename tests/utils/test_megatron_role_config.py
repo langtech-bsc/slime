@@ -22,7 +22,12 @@ def _base_args(**overrides):
         use_kl_loss=False,
         use_opd=True,
         opd_type="megatron",
+        opd_teacher_load="/teacher/checkpoint",
         custom_advantage_function_path="slime.test.adv",
+        entropy_coef=0.1,
+        no_load_optim=False,
+        no_load_rng=False,
+        disable_param_buffers_cpu_backup=False,
         untie_embeddings_and_output_weights=False,
         actor_num_nodes=1,
         actor_num_gpus_per_node=1,
@@ -88,6 +93,33 @@ class TestMegatronRoleConfig:
         assert critic_args.lr == args.lr
         assert critic_args.kl_coef == 0
         assert critic_args.use_opd is False
+
+    def test_opd_teacher_role_is_inference_only(self):
+        from slime.utils.arguments import parse_megatron_role_args
+
+        path = _write_yaml(
+            {
+                "megatron": [
+                    {
+                        "name": "default",
+                        "role": "opd_teacher",
+                        "overrides": {"num_layers": 48, "tensor_model_parallel_size": 4},
+                    },
+                ]
+            }
+        )
+        args = _base_args()
+
+        teacher_args = parse_megatron_role_args(args, path, role="opd_teacher")
+
+        assert teacher_args.load == args.opd_teacher_load
+        assert teacher_args.num_layers == 48
+        assert teacher_args.tensor_model_parallel_size == 4
+        assert teacher_args.use_opd is False
+        assert teacher_args.entropy_coef == 0
+        assert teacher_args.no_load_optim is True
+        assert teacher_args.no_load_rng is True
+        assert teacher_args.disable_param_buffers_cpu_backup is True
 
     @pytest.mark.parametrize(
         "config",

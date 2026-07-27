@@ -234,6 +234,19 @@ def make_slime_validate_args(**overrides):
         use_opd=False,
         opd_type=None,
         opd_teacher_load=None,
+        opd_top_k=2048,
+        opd_teacher_num_nodes=1,
+        opd_teacher_num_gpus_per_node=4,
+        opd_hidden_cache_max_pending_batches=2,
+        opd_hidden_transfer_chunk_rows=1,
+        opd_hidden_projection_chunk_tokens=1024,
+        opd_vocab_chunk_size=4096,
+        opd_pipeline_depth=2,
+        opd_temperature=1.0,
+        opd_pointwise_clip=0.05,
+        opd_stage_timeout_seconds=900,
+        opd_teacher_prompt_mode="trajectory",
+        opd_teacher_prompt_function_path=None,
         megatron_to_hf_mode="raw",
         load=None,
         hf_checkpoint="/tmp/hf",
@@ -248,6 +261,10 @@ def make_slime_validate_args(**overrides):
         save=None,
         kl_loss_coef=0,
         advantage_estimator="grpo",
+        entropy_coef=0,
+        use_critic=False,
+        context_parallel_size=1,
+        pipeline_model_parallel_size=1,
         normalize_advantages=False,
         use_rollout_logprobs=False,
         use_tis=False,
@@ -351,6 +368,35 @@ def test_slime_validate_args_preserves_zero_rollout_gpus_without_colocate(monkey
     assert args.actor_num_nodes == 1
     assert args.offload_train is False
     assert args.offload_rollout is False
+
+
+@pytest.mark.unit
+def test_async_opd_rejects_pipeline_larger_than_cache(monkeypatch, tmp_path):
+    module = load_slime_arguments_module(monkeypatch)
+    args = make_slime_validate_args(
+        use_opd=True,
+        opd_type="megatron_async",
+        opd_teacher_load=str(tmp_path),
+        opd_pipeline_depth=3,
+        opd_hidden_cache_max_pending_batches=2,
+    )
+
+    with pytest.raises(ValueError, match="cannot exceed"):
+        module.slime_validate_args(args)
+
+
+@pytest.mark.unit
+def test_async_opd_rejects_negative_pointwise_clip(monkeypatch, tmp_path):
+    module = load_slime_arguments_module(monkeypatch)
+    args = make_slime_validate_args(
+        use_opd=True,
+        opd_type="megatron_async",
+        opd_teacher_load=str(tmp_path),
+        opd_pointwise_clip=-0.1,
+    )
+
+    with pytest.raises(ValueError, match="must be non-negative"):
+        module.slime_validate_args(args)
 
 
 @pytest.mark.unit

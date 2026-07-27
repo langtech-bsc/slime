@@ -759,7 +759,10 @@ class RolloutManager:
         if self.custom_convert_samples_to_train_data_func is not None:
             return self.custom_convert_samples_to_train_data_func(self.args, samples)
 
-        raw_rewards, rewards = self._post_process_rewards(samples)
+        if getattr(self.args, "use_opd", False) and getattr(self.args, "opd_type", None) == "megatron_async":
+            raw_rewards = rewards = [0.0] * len(samples)
+        else:
+            raw_rewards, rewards = self._post_process_rewards(samples)
 
         assert len(raw_rewards) == len(samples)
         assert len(rewards) == len(samples)
@@ -785,6 +788,18 @@ class RolloutManager:
             "sample_indices": [sample.index for sample in samples],
             "rollout_ids": rollout_ids,
         }
+        if (
+            getattr(self.args, "use_opd", False)
+            and getattr(self.args, "opd_type", None) == "megatron_async"
+            and getattr(self.args, "opd_teacher_prompt_mode", "trajectory") == "custom"
+        ):
+            train_data.update(
+                {
+                    "prompt": [sample.prompt for sample in samples],
+                    "label": [sample.label for sample in samples],
+                    "response": [sample.response for sample in samples],
+                }
+            )
 
         # loss mask
         # TODO: compress the loss mask
@@ -921,6 +936,8 @@ class RolloutManager:
                 "rollout_top_p_token_offsets",
                 "rollout_routed_experts",
                 "prompt",
+                "label",
+                "response",
                 "teacher_log_probs",
             ]:
                 if key not in data:

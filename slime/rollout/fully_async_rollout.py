@@ -465,6 +465,11 @@ class AsyncRolloutWorker:
 
     async def _reward_sample_or_group(self, sample_or_group: Sample | list[Sample]) -> Sample | list[Sample]:
         async with self.reward_computation_tracker.measure_rm(sample_or_group):
+            if getattr(self.args, "use_opd", False) and getattr(self.args, "opd_type", None) == "megatron_async":
+                samples = sample_or_group if isinstance(sample_or_group, list) else [sample_or_group]
+                for sample in samples:
+                    sample.reward = 0.0
+                return sample_or_group
             if isinstance(sample_or_group, list):
                 samples_need_reward = [sample for sample in sample_or_group if sample.reward is None]
                 if samples_need_reward:

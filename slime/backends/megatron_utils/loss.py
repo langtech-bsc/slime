@@ -1165,6 +1165,62 @@ def value_loss_function(
     return loss, reported_loss
 
 
+def opd_distillation_loss_function(
+    args: Namespace,
+    batch: RolloutBatch,
+    hidden_states: torch.Tensor,
+    sum_of_sample_mean: Callable[[torch.Tensor], torch.Tensor],
+) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+    from slime.utils.opd import hidden_topk_kl
+
+    if hidden_states.ndim != 3 or hidden_states.size(0) != 1:
+        raise ValueError(f"Unexpected OPD student hidden shape: {hidden_states.shape}")
+    if getattr(args, "_opd_student_head", None) is None or getattr(args, "_opd_teacher_head", None) is None:
+        raise RuntimeError("OPD output-head weights were not installed on the trainer")
+
+    packed_student = hidden_states.squeeze(0)
+    student_responses = []
+    offset = 0
+    for total_length, response_length in zip(batch["total_lengths"], batch["response_lengths"], strict=True):
+        end = offset + total_length
+        start = end - response_length
+        student_responses.append(packed_student[start - 1 : end - 1])
+        offset = end
+    student_response_hidden = torch.cat(student_responses, dim=0)
+    teacher_response_hidden = torch.cat(batch["opd_teacher_hidden_states"], dim=0).to(
+        device=student_response_hidden.device,
+        dtype=student_response_hidden.dtype,
+        non_blocking=True,
+    )
+    valid_mask = torch.cat(batch["loss_masks"], dim=0).to(
+        device=student_response_hidden.device,
+        dtype=torch.bool,
+    )
+
+    token_loss, stats = hidden_topk_kl(
+        student_response_hidden,
+        args._opd_student_head,
+        teacher_response_hidden,
+        args._opd_teacher_head,
+        valid_mask,
+        top_k=args.opd_top_k,
+        temperature=args.opd_temperature,
+        direction=args.opd_kl_direction,
+        normalize_teacher=args.opd_normalize_topk,
+        pointwise_clip=args.opd_pointwise_clip,
+        token_chunk_size=args.opd_hidden_projection_chunk_tokens,
+        vocab_chunk_size=args.opd_vocab_chunk_size,
+        process_group=mpu.get_tensor_model_parallel_group(),
+    )
+    loss = sum_of_sample_mean(token_loss)
+    return loss, {
+        "loss": loss.detach(),
+        "opd_kl": loss.detach(),
+        "opd_clip_frac": stats["clip_frac"].detach(),
+        "opd_topk_mass": sum_of_sample_mean(stats["topk_mass"]).detach(),
+    }
+
+
 def sft_loss_function(
     args: Namespace,
     batch: RolloutBatch,
@@ -1262,6 +1318,8 @@ def loss_function(
     match args.loss_type:
         case "policy_loss":
             func = policy_loss_function
+        case "opd_distillation_loss":
+            func = opd_distillation_loss_function
         case "value_loss":
             func = value_loss_function
         case "sft_loss":

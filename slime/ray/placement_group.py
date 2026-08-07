@@ -148,7 +148,7 @@ def allocate_train_group(args, num_nodes, num_gpus_per_node, pg, role="actor"):
     )
 
 
-def create_training_models(args, pgs, rollout_manager):
+def create_training_models(args, pgs, rollout_manager=None, *, attach_rollout_manager=True):
     actor_args = args
     if args.megatron_config_path is not None:
         from slime.utils.arguments import parse_megatron_role_args
@@ -202,12 +202,15 @@ def create_training_models(args, pgs, rollout_manager):
     if args.start_rollout_id is None:
         args.start_rollout_id = start_rollout_ids[0]
 
-    actor_model.set_rollout_manager(rollout_manager)
-    if args.use_critic:
-        critic_model.set_rollout_manager(rollout_manager)
+    if attach_rollout_manager:
+        if rollout_manager is None:
+            raise ValueError("rollout_manager is required when attaching it during model creation")
+        actor_model.set_rollout_manager(rollout_manager)
+        if args.use_critic:
+            critic_model.set_rollout_manager(rollout_manager)
 
-    if args.rollout_global_dataset:
-        ray.get(rollout_manager.load.remote(args.start_rollout_id - 1))
+        if args.rollout_global_dataset:
+            ray.get(rollout_manager.load.remote(args.start_rollout_id - 1))
 
     return actor_model, critic_model
 

@@ -1,6 +1,6 @@
 import argparse
+import sys
 
-from sglang.srt.server_args import ServerArgs
 from sglang_router.launch_router import RouterArgs
 from slime.utils.http_utils import _wrap_ipv6
 
@@ -110,6 +110,10 @@ def add_sglang_arguments(parser):
 
         old_add_argument(*new_name_or_flags_list, **final_kwargs)
 
+    # Import lazily: external rollout engines are launched outside the trainer
+    # process and must not require an in-process SGLang installation.
+    from sglang.srt.server_args import ServerArgs
+
     parser.add_argument = new_add_argument_wrapper
     ServerArgs.add_cli_args(parser)
     parser.add_argument = old_add_argument
@@ -135,6 +139,26 @@ def add_sglang_arguments(parser):
         ),
     )
 
+    return parser
+
+
+def add_external_sglang_arguments(parser):
+    """Add only the SGLang settings consumed by external-engine coordination.
+
+    This deliberately excludes ``ServerArgs``.  With
+    ``--rollout-external-engine-addrs`` the trainer never starts an SGLang
+    server; importing the rollout image's native SGLang package into the
+    trainer would unnecessarily couple their Torch ABIs.
+    """
+    parser = add_sglang_router_arguments(parser)
+    parser.set_defaults(router_balance_abs_threshold=10, router_balance_rel_threshold=1.2)
+    parser.add_argument("--sglang-server-concurrency", type=int, default=512)
+    parser.add_argument("--sglang-data-parallel-size", type=int, default=1)
+    parser.add_argument("--sglang-pipeline-parallel-size", type=int, default=1)
+    parser.add_argument("--sglang-expert-parallel-size", type=int, default=1)
+    parser.add_argument("--sglang-enable-dp-attention", action="store_true", default=False)
+    parser.add_argument("--prefill-num-servers", type=int, default=None)
+    parser.add_argument("--sglang-config", type=str, default=None)
     return parser
 
 
@@ -182,8 +206,15 @@ def sglang_parse_args():
     Returns:
         argparse.Namespace: Parsed sglang arguments (all attributes prefixed with sglang_).
     """
+    external_parser = argparse.ArgumentParser(add_help=False)
+    external_parser.add_argument("--rollout-external-engine-addrs", nargs="+", default=None)
+    external_args, _ = external_parser.parse_known_args(sys.argv[1:])
+
     parser = argparse.ArgumentParser(add_help=False)
-    add_sglang_arguments(parser)
+    if external_args.rollout_external_engine_addrs is not None:
+        add_external_sglang_arguments(parser)
+    else:
+        add_sglang_arguments(parser)
 
     # Compute default sglang_tensor_parallel_size from CLI args
     temp_parser = argparse.ArgumentParser(add_help=False)

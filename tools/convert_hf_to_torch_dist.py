@@ -1,6 +1,9 @@
 import gc
+import json
 import os
 import shutil
+from types import SimpleNamespace
+from glob import glob
 
 import torch
 import torch.distributed as dist
@@ -33,6 +36,66 @@ def add_convertion_args(parser):
     except Exception:
         pass
     return parser
+
+
+def _qwen3_5_config_from_checkpoint(hf_model_path: str):
+    """Load the config fields consumed by the Qwen3.5 mbridge plugin.
+
+    Qwen3.5 checkpoints predate support in the Transformers version bundled in
+    the frozen training image.  The mbridge plugin only needs the serialized
+    config attributes (especially ``text_config``), so avoid making conversion
+    depend on an unavailable Transformers model class.
+    """
+
+    def as_namespace(value):
+        if isinstance(value, dict):
+            return SimpleNamespace(**{key: as_namespace(item) for key, item in value.items()})
+        if isinstance(value, list):
+            return [as_namespace(item) for item in value]
+        return value
+
+    with open(os.path.join(hf_model_path, "config.json"), encoding="utf-8") as config_file:
+        config = as_namespace(json.load(config_file))
+    if getattr(config, "model_type", None) != "qwen3_5":
+        raise ValueError(f"Expected a qwen3_5 checkpoint at {hf_model_path}")
+    return config
+
+
+def _load_bridge(hf_model_path: str):
+    try:
+        return AutoBridge.from_pretrained(hf_model_path, trust_remote_code=True)
+    except ValueError as exc:
+        # Transformers raises this exact architecture error before mbridge gets
+        # a chance to select slime_plugins.mbridge.Qwen3_5Bridge.
+        if "model type `qwen3_5`" not in str(exc):
+            raise
+        bridge = AutoBridge.from_config(_qwen3_5_config_from_checkpoint(hf_model_path))
+        # SafeTensorIO independently loads AutoConfig only to decide whether a
+        # tied lm_head should be omitted.  Qwen3.5-9B is untied, so construct
+        # the same index directly and keep the conversion independent from a
+        # Transformers architecture registration.
+        from mbridge.core.safetensor_io import SafeTensorIO
+
+        def qwen3_5_safetensor_io(weights_path: str):
+            safetensor_io = SafeTensorIO.__new__(SafeTensorIO)
+            index_file = os.path.join(weights_path, "model.safetensors.index.json")
+            safetensor_io.index = {}
+            safetensor_io.origin_index = {}
+            if os.path.exists(index_file):
+                with open(index_file, encoding="utf-8") as index_handle:
+                    safetensor_io.origin_index = json.load(index_handle)
+                safetensor_io.index = safetensor_io.origin_index["weight_map"]
+            else:
+                from safetensors import safe_open
+
+                for filename in glob(os.path.join(weights_path, "*.safetensors")):
+                    with safe_open(filename, framework="pt", device="cpu") as handle:
+                        safetensor_io.index.update({key: os.path.basename(filename) for key in handle.keys()})
+            safetensor_io.hf_dir = weights_path
+            return safetensor_io
+
+        bridge._get_safetensor_io = lambda weights_path: qwen3_5_safetensor_io(bridge._get_actual_hf_path(weights_path))
+        return bridge
 
 
 def get_args():
@@ -116,7 +179,7 @@ def main():
 
     # Load model
     hf_model_path = args.hf_checkpoint
-    bridge = AutoBridge.from_pretrained(hf_model_path, trust_remote_code=True)
+    bridge = _load_bridge(hf_model_path)
     bridge.load_weights(model, hf_model_path, memory_efficient=True)
     print(f"Model loaded: {hf_model_path}")
 

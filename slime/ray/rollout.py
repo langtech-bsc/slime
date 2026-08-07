@@ -13,7 +13,15 @@ import numpy as np
 import ray
 import torch
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
-from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
+# External rollout engines run in a separate SGLang image.  The trainer only
+# uses these values as tags when it owns local engines, so retain the canonical
+# string values when SGLang is intentionally absent from the trainer runtime.
+try:
+    from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
+except ModuleNotFoundError:
+    GPU_MEMORY_TYPE_CUDA_GRAPH = "cuda_graph"
+    GPU_MEMORY_TYPE_KV_CACHE = "kv_cache"
+    GPU_MEMORY_TYPE_WEIGHTS = "weights"
 
 from slime.backends.sglang_utils.external import start_external_rollout_servers
 from slime.backends.sglang_utils.sglang_config import ModelConfig, ServerGroupConfig, SglangConfig

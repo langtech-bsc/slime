@@ -29,12 +29,26 @@ def train(args):
     pgs = create_placement_groups(args)
     init_tracking(args)
 
-    # create the rollout manager, with sglang engines inside.
-    # need to initialize rollout manager first to calculate num_rollout
-    rollout_manager, num_rollout_per_epoch = create_rollout_manager(args, pgs["rollout"])
+    # Start actor/critic initialization before waiting for external SGLang
+    # discovery.  The MN5 launcher starts those servers concurrently; the
+    # rollout manager performs discover_external_engines_with_retry after the
+    # actor model has begun loading.
+    actor_model, critic_model = create_training_models(
+        args,
+        pgs,
+        rollout_manager=None,
+        attach_rollout_manager=False,
+    )
 
-    # create the actor and critic models
-    actor_model, critic_model = create_training_models(args, pgs, rollout_manager)
+    # Create the rollout manager after actor initialization.  For external
+    # engines this is the synchronization point at which server_info is
+    # discovered and the Ray-side engine adapters are initialized.
+    rollout_manager, num_rollout_per_epoch = create_rollout_manager(args, pgs["rollout"])
+    actor_model.set_rollout_manager(rollout_manager)
+    if critic_model is not None:
+        critic_model.set_rollout_manager(rollout_manager)
+    if args.rollout_global_dataset:
+        ray.get(rollout_manager.load.remote(args.start_rollout_id - 1))
 
     # Always push actor weights to rollout once weights are loaded.
     actor_model.update_weights()

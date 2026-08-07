@@ -10,8 +10,8 @@ These are expected to exist on MareNostrum 5 project storage. Verify paths befor
 |------|------|--------|
 | Singularity image | `/gpfs/projects/bsc88/singularity-images/verlai.sif` | Frozen VERL/Megatron/SGLang stack |
 | VERL / SGLang env | `/gpfs/projects/bsc88/text/environments/verl_mn5_python3.12_20260220` | `VERL_ENV` in `runtime_env_common.sh` |
-| Extra Python packages | `.../vision_rl_mn5_python3.12_20260206/lib/python3.12/site-packages` | Bind-mounted as `/extra_site_packages` |
-| FlashAttention overlay | `.../vision_rl_mn5_python3.12_20260206/lib/python3.12/flash_attn_site_packages` | Bind-mounted as `/flash_attn_site_packages` |
+| Extra Python packages | `.../rl_mn5_python3.12_20260206/lib/python3.12/site-packages` | Bind-mounted as `/extra_site_packages` |
+| FlashAttention overlay | `.../rl_mn5_python3.12_20260206/lib/python3.12/flash_attn_site_packages` | Bind-mounted as `/flash_attn_site_packages` |
 | Runtime helpers | `/gpfs/projects/bsc88/text/models/vision/salamandra-rl-parent/Salamandra-rl/quick_start/runtime_env_common.sh` | Shared bind/env wiring |
 | Salamandra-7B HF weights | `/gpfs/projects/bsc88/text/models/BSC-NeMo-RL_prod_2026-03-20/results/sft/yolo-M4/hf-safetensors/Salamandra-7b_pre-1.4_sft-5.0_lr2e-5_bs256_warmup20` | Test model for this migration |
 | slime repo checkout | e.g. `/home/bsc/bsc474046/repositories/rl-training` (with `slime/` submodule) | Bind `RL_TRAINING_ROOT` and `SLIME_ROOT` at job launch |

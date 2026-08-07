@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import dataclasses
 import logging
+import os
+import time
 from urllib.parse import urlparse
 
 import requests
@@ -104,19 +106,117 @@ def discover_external_engines(addrs: list[str], timeout: float = 30.0) -> list[E
     return infos
 
 
+def _external_engine_infos_to_args(args, infos: list[ExternalEngineInfo]) -> None:
+    args.rollout_external_engine_infos = [info.to_dict() for info in infos]
+    args.rollout_num_engines = len(infos)
+    args.rollout_num_gpus = sum(info.num_gpus for info in infos)
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None:
+        return default
+    try:
+        parsed = float(value)
+    except ValueError as exc:
+        raise ValueError(f"{name} must be a positive number, got {value!r}") from exc
+    if parsed <= 0:
+        raise ValueError(f"{name} must be positive, got {value!r}")
+    return parsed
+
+
+def discover_external_engines_with_retry(
+    addrs: list[str],
+    *,
+    logger: logging.Logger | None = None,
+    request_timeout: float | None = None,
+    overall_timeout: float | None = None,
+    retry_interval: float | None = None,
+) -> list[ExternalEngineInfo]:
+    """Discover pre-launched engines while they finish asynchronous startup.
+
+    The launcher starts the trainer and external engines concurrently.  During
+    that window ``/server_info`` can legitimately refuse connections, so a
+    single discovery attempt is not an actionable configuration failure.
+    """
+    request_timeout = request_timeout or _env_float(
+        "EXTERNAL_ENGINE_DISCOVERY_REQUEST_TIMEOUT_S", 30.0
+    )
+    overall_timeout = overall_timeout or _env_float(
+        "EXTERNAL_ENGINE_DISCOVERY_TIMEOUT_S", 1800.0
+    )
+    retry_interval = retry_interval or _env_float(
+        "EXTERNAL_ENGINE_DISCOVERY_RETRY_INTERVAL_S", 5.0
+    )
+    deadline = time.monotonic() + overall_timeout
+    attempt = 0
+    while True:
+        attempt += 1
+        try:
+            infos = discover_external_engines(addrs, timeout=request_timeout)
+            if not infos:
+                raise RuntimeError("discovery returned no external engines")
+            if logger is not None and attempt > 1:
+                logger.info(
+                    "External SGLang discovery succeeded on attempt %d after %.1fs",
+                    attempt,
+                    overall_timeout - max(0.0, deadline - time.monotonic()),
+                )
+            return infos
+        except Exception as exc:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise RuntimeError(
+                    "External SGLang engines did not become discoverable within "
+                    f"{overall_timeout:g}s; last error: {exc}"
+                ) from exc
+            if logger is not None:
+                logger.warning(
+                    "External SGLang discovery attempt %d failed (%.1fs remain): %s; "
+                    "retrying in %.1fs",
+                    attempt,
+                    remaining,
+                    exc,
+                    min(retry_interval, remaining),
+                )
+            time.sleep(min(retry_interval, remaining))
+
+
 def apply_external_engine_info_to_args(args, logger=None) -> None:
     """Detect external engines and store the derived topology on ``args``."""
     addrs = args.rollout_external_engine_addrs
     if not addrs:
         raise ValueError("apply_external_engine_info_to_args requires --rollout-external-engine-addrs.")
 
-    infos = discover_external_engines(addrs)
-    if not infos:
-        raise ValueError("--rollout-external-engine-addrs did not contain any engines.")
+    if os.environ.get("SLIME_DEFER_EXTERNAL_ENGINE_DISCOVERY") == "1":
+        # The MN5 launcher knows the external topology before the servers are
+        # healthy.  Preserve enough information for placement-group creation,
+        # then perform real discovery inside RolloutManager after actor model
+        # loading has started.
+        count = int(os.environ.get("ROLLOUT_EXTERNAL_ENGINE_COUNT", "0"))
+        gpus_per_engine = int(
+            os.environ.get("ROLLOUT_EXTERNAL_ENGINE_GPUS_PER_ENGINE", "0")
+        )
+        if count <= 0 or gpus_per_engine <= 0:
+            raise ValueError(
+                "deferred external discovery requires positive "
+                "ROLLOUT_EXTERNAL_ENGINE_COUNT and "
+                "ROLLOUT_EXTERNAL_ENGINE_GPUS_PER_ENGINE"
+            )
+        args.rollout_external_engine_infos = None
+        args.rollout_num_engines = count
+        args.rollout_num_gpus = count * gpus_per_engine
+        if logger is not None:
+            logger.info(
+                "Deferring external SGLang discovery until rollout-manager "
+                "initialization (%d engines, %d GPUs)",
+                count,
+                args.rollout_num_gpus,
+            )
+        return
 
-    args.rollout_external_engine_infos = [info.to_dict() for info in infos]
-    args.rollout_num_engines = len(infos)
-    args.rollout_num_gpus = sum(info.num_gpus for info in infos)
+    infos = discover_external_engines_with_retry(addrs, logger=logger)
+    _external_engine_infos_to_args(args, infos)
 
     if logger is not None:
         summary = [
@@ -181,7 +281,14 @@ def start_external_rollout_servers(args, *, start_router) -> tuple[dict[str, Ext
     from slime.backends.sglang_utils.sglang_engine import SGLangEngine
     from slime.ray.utils import add_default_ray_env_vars
 
-    infos = external_engine_infos_from_args(args)
+    if getattr(args, "rollout_external_engine_infos", None) is None:
+        infos = discover_external_engines_with_retry(
+            args.rollout_external_engine_addrs,
+            logger=logger,
+        )
+        _external_engine_infos_to_args(args, infos)
+    else:
+        infos = external_engine_infos_from_args(args)
     router_ip, router_port = start_router(args, has_pd_disaggregation=any(info.is_pd_worker for info in infos))
     args.sglang_router_ip = router_ip
     args.sglang_router_port = router_port

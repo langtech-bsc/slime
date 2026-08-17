@@ -327,6 +327,14 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--sglang-stream-output",
+                action="store_true",
+                help=(
+                    "The external SGLang servers use --stream-output, so streaming /generate "
+                    "chunks contain disjoint token/text segments instead of cumulative output."
+                ),
+            )
+            parser.add_argument(
                 "--fully-async-reward-concurrency",
                 type=int,
                 default=None,
@@ -383,6 +391,24 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
             parser.add_argument(
                 "--rollout-top-k", type=int, default=-1, help="the top-k for the inference engine during rollout."
+            )
+            parser.add_argument(
+                "--rollout-min-p",
+                type=float,
+                default=0.0,
+                help="the minimum probability for the inference engine during rollout.",
+            )
+            parser.add_argument(
+                "--rollout-presence-penalty",
+                type=float,
+                default=0.0,
+                help="the presence penalty for the inference engine during rollout.",
+            )
+            parser.add_argument(
+                "--rollout-repetition-penalty",
+                type=float,
+                default=1.0,
+                help="the repetition penalty for the inference engine during rollout.",
             )
             parser.add_argument(
                 "--rollout-max-context-len",

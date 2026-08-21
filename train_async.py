@@ -32,7 +32,9 @@ def train(args):
     # Start actor/critic initialization before waiting for external SGLang
     # discovery.  The MN5 launcher starts those servers concurrently; the
     # rollout manager performs discover_external_engines_with_retry after the
-    # actor model has begun loading.
+    # actor model has begun loading.  create_training_models resolves
+    # --num-epoch into --num-rollout first, because Megatron's LR scheduler
+    # needs that value during actor init.
     actor_model, critic_model = create_training_models(
         args,
         pgs,

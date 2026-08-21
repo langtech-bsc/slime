@@ -164,6 +164,13 @@ def get_optimizer_param_scheduler(args: Namespace, optimizer: MegatronOptimizer)
     # resume), so the worst case is the cosine/linear schedule reaches its
     # plateau slightly early or late. Pass ``--lr-decay-iters`` explicitly if you
     # need exact decay control.
+    if args.num_rollout is None:
+        raise ValueError(
+            "num_rollout is None while creating the optimizer scheduler. "
+            "Async training initializes Megatron before RolloutManager computes "
+            "num_rollout from --num-epoch; resolve_num_rollout() must run first, "
+            "or pass --num-rollout."
+        )
     args.train_iters = args.num_rollout * args.rollout_batch_size * args.n_samples_per_prompt // args.global_batch_size
     if args.lr_decay_iters is None:
         args.lr_decay_iters = args.train_iters

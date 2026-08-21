@@ -148,7 +148,58 @@ def allocate_train_group(args, num_nodes, num_gpus_per_node, pg, role="actor"):
     )
 
 
+def resolve_num_rollout(args):
+    """Fill ``args.num_rollout`` from ``num_epoch * dataset_size`` when needed.
+
+    Sync ``train.py`` can wait until ``RolloutManager`` exists, because that
+    path creates the manager before Megatron. Async ``train_async.py`` starts
+    actor init first so it can overlap model load with external SGLang
+    discovery, but ``get_optimizer_param_scheduler`` needs ``num_rollout`` to
+    size ``train_iters``. Instantiating the configured data source on the
+    driver is enough to compute the same value ``RolloutManager`` would.
+
+    Returns the number of rollouts per epoch when computed from the dataset,
+    otherwise ``None``.
+    """
+    if getattr(args, "num_rollout", None) is not None:
+        return None
+    if getattr(args, "num_epoch", None) is None:
+        return None
+
+    assert args.rollout_global_dataset, (
+        "num_epoch is set, but rollout_global_dataset is not set, "
+        "please remove --disable-rollout-global-dataset to use num_epoch"
+    )
+
+    from slime.utils.misc import load_function
+
+    data_source_cls = load_function(args.data_source_path)
+    data_source = data_source_cls(args)
+    dataset_size = len(data_source)
+    num_rollout_per_epoch = dataset_size // args.rollout_batch_size
+    args.num_rollout = num_rollout_per_epoch * args.num_epoch
+    assert args.num_rollout > 0, (
+        f"num_rollout computed as {args.num_rollout} from num_epoch={args.num_epoch}, "
+        f"dataset_size={dataset_size}, rollout_batch_size={args.rollout_batch_size}"
+    )
+    logger.info(
+        "Resolved num_rollout=%s from num_epoch=%s, dataset_size=%s, "
+        "rollout_batch_size=%s (%s rollouts/epoch)",
+        args.num_rollout,
+        args.num_epoch,
+        dataset_size,
+        args.rollout_batch_size,
+        num_rollout_per_epoch,
+    )
+    return num_rollout_per_epoch
+
+
 def create_training_models(args, pgs, rollout_manager=None, *, attach_rollout_manager=True):
+    # Async training initializes Megatron before RolloutManager can compute
+    # num_rollout from --num-epoch. Resolve it here so actor/critic args
+    # already carry the value used to size the LR schedule.
+    resolve_num_rollout(args)
+
     actor_args = args
     if args.megatron_config_path is not None:
         from slime.utils.arguments import parse_megatron_role_args
@@ -227,12 +278,16 @@ def create_rollout_manager(args, pg):
         rollout_manager_options["enable_tensor_transport"] = True
     rollout_manager = RolloutManager.options(**rollout_manager_options).remote(args, pg)
 
-    # calculate num_rollout from num_epoch
+    # calculate num_rollout from num_epoch. When async training already
+    # resolved num_rollout for Megatron init, still fetch the per-epoch
+    # count so save/eval can fire on epoch boundaries.
     num_rollout_per_epoch = None
     if args.num_rollout is None:
         num_rollout_per_epoch = ray.get(rollout_manager.get_num_rollout_per_epoch.remote())
         args.num_rollout = num_rollout_per_epoch * args.num_epoch
         assert args.num_rollout > 0
+    elif args.num_epoch is not None and args.rollout_global_dataset:
+        num_rollout_per_epoch = ray.get(rollout_manager.get_num_rollout_per_epoch.remote())
 
     if args.check_weight_update_equal:
         ray.get(rollout_manager.check_weights.remote(action="snapshot"))

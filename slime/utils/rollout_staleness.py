@@ -267,7 +267,12 @@ def log_rollout_weight_staleness_metrics(
                 filter_metrics["effective_max_rollout_weight_staleness"],
                 1,
             )
-    gather_log_data("rollout_weight_staleness", args, rollout_id, log_dict)
+    # ``gather_log_data`` returns a reduced payload only on the DP source rank.
+    # W&B is initialized only on that rank, so non-source DP ranks must not
+    # continue into the train-side logging below.
+    reduced_log_dict = gather_log_data("rollout_weight_staleness", args, rollout_id, log_dict)
+    if reduced_log_dict is None:
+        return
 
     train_step = compute_train_step(rollout_id, num_steps_per_rollout)
     wandb_payload: dict[str, float | int] = {

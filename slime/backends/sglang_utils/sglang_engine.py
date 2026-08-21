@@ -187,8 +187,20 @@ class SGLangEngine(RayActor):
                     actual_value == expect_value
                 ), f"{name=} {expect_value=} {actual_value=} {expect_server_args=} {actual_server_args=}"
 
-        actual_server_args = get_server_info(f"http://{self.server_host}:{self.server_port}")
-        _sanity_check_server_args(actual_server_args, expect_server_args)
+        server_url = f"http://{self.server_host}:{self.server_port}"
+        if os.environ.get("SLIME_EXTERNAL_ENGINE_SKIP_SERVER_INFO_CHECK") == "1":
+            timeout = float(os.environ.get("SLIME_EXTERNAL_ENGINE_HEALTH_TIMEOUT_S", "10"))
+            response = requests.get(f"{server_url}/health", timeout=timeout)
+            response.raise_for_status()
+            logger.info(
+                "External SGLang engine passed /health; skipping /server_info "
+                "sanity check (rank=%d, url=%s)",
+                self.rank,
+                server_url,
+            )
+        else:
+            actual_server_args = get_server_info(server_url)
+            _sanity_check_server_args(actual_server_args, expect_server_args)
         self._register_to_router(expect_server_args)
 
     def _init_normal(self, server_args_dict):

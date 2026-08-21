@@ -190,9 +190,9 @@ def apply_external_engine_info_to_args(args, logger=None) -> None:
 
     if os.environ.get("SLIME_DEFER_EXTERNAL_ENGINE_DISCOVERY") == "1":
         # The MN5 launcher knows the external topology before the servers are
-        # healthy.  Preserve enough information for placement-group creation,
-        # then perform real discovery inside RolloutManager after actor model
-        # loading has started.
+        # healthy.  Preserve the known topology rather than requiring the
+        # SGLang metadata endpoint, which can remain blocked while the server's
+        # regular health endpoint is already responding.
         count = int(os.environ.get("ROLLOUT_EXTERNAL_ENGINE_COUNT", "0"))
         gpus_per_engine = int(
             os.environ.get("ROLLOUT_EXTERNAL_ENGINE_GPUS_PER_ENGINE", "0")
@@ -203,13 +203,36 @@ def apply_external_engine_info_to_args(args, logger=None) -> None:
                 "ROLLOUT_EXTERNAL_ENGINE_COUNT and "
                 "ROLLOUT_EXTERNAL_ENGINE_GPUS_PER_ENGINE"
             )
-        args.rollout_external_engine_infos = None
-        args.rollout_num_engines = count
-        args.rollout_num_gpus = count * gpus_per_engine
+        if len(addrs) != count:
+            raise ValueError(
+                "deferred external discovery address count does not match "
+                f"ROLLOUT_EXTERNAL_ENGINE_COUNT: {len(addrs)} != {count}"
+            )
+        infos = []
+        for addr in addrs:
+            url = normalize_external_engine_addr(addr)
+            parsed = urlparse(url)
+            assert parsed.hostname is not None and parsed.port is not None
+            infos.append(
+                ExternalEngineInfo(
+                    url=url,
+                    host=parsed.hostname,
+                    port=parsed.port,
+                    worker_type="regular",
+                    num_gpus=gpus_per_engine,
+                    server_info={
+                        "tp_size": gpus_per_engine,
+                        "pp_size": 1,
+                        "num_gpus": gpus_per_engine,
+                        "disaggregation_mode": "null",
+                    },
+                )
+            )
+        _external_engine_infos_to_args(args, infos)
         if logger is not None:
             logger.info(
-                "Deferring external SGLang discovery until rollout-manager "
-                "initialization (%d engines, %d GPUs)",
+                "Using launcher-provided external SGLang topology; "
+                "metadata discovery deferred/skipped (%d engines, %d GPUs)",
                 count,
                 args.rollout_num_gpus,
             )

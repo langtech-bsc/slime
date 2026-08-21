@@ -26,6 +26,9 @@ NOSET_VISIBLE_DEVICES_ENV_VARS_LIST = [
 RAY_DEFAULT_ENV_VARS = {
     # Ray's uvloop integration has caused intermittent async actor issues.
     "RAY_USE_UVLOOP": "0",
+    # Megatron validate_args requires this whenever tensor or context
+    # parallelism is greater than 1.
+    "CUDA_DEVICE_MAX_CONNECTIONS": "1",
 }
 
 

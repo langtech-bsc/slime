@@ -186,13 +186,18 @@ def test_apply_external_engine_info_can_defer_discovery(monkeypatch):
     monkeypatch.setenv("SLIME_DEFER_EXTERNAL_ENGINE_DISCOVERY", "1")
     monkeypatch.setenv("ROLLOUT_EXTERNAL_ENGINE_COUNT", "6")
     monkeypatch.setenv("ROLLOUT_EXTERNAL_ENGINE_GPUS_PER_ENGINE", "2")
-    args = Namespace(rollout_external_engine_addrs=["host1:10090"])
+    args = Namespace(
+        rollout_external_engine_addrs=[f"host{i}:10090" for i in range(6)]
+    )
 
     apply_external_engine_info_to_args(args)
 
-    assert args.rollout_external_engine_infos is None
+    assert len(args.rollout_external_engine_infos) == 6
     assert args.rollout_num_engines == 6
     assert args.rollout_num_gpus == 12
+    assert {info["worker_type"] for info in args.rollout_external_engine_infos} == {"regular"}
+    assert {info["num_gpus"] for info in args.rollout_external_engine_infos} == {2}
+    assert all(info["server_info"]["tp_size"] == 2 for info in args.rollout_external_engine_infos)
 
 
 def test_apply_external_engine_info_requires_addrs():

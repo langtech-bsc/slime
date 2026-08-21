@@ -1,12 +1,20 @@
 """Tests for rollout weight-version staleness filtering."""
 
-import torch
+import socket
+from types import SimpleNamespace
+from unittest.mock import patch
+
 import pytest
+import torch
+import torch.distributed as dist
+import torch.multiprocessing as mp
+import wandb
 
 from slime.utils.rollout_staleness import (
     RolloutStalenessStats,
     RolloutWeightStalenessStats,
     discard_stale_rollout_samples,
+    log_rollout_weight_staleness_metrics,
     min_rollout_weight_version,
     raise_on_stale_rollout_samples,
     resolve_effective_max_staleness,
@@ -14,6 +22,69 @@ from slime.utils.rollout_staleness import (
     rollout_weight_staleness,
     rollout_weight_staleness_stats_for_training,
 )
+
+
+def _run_staleness_logger_cpu_worker(rank: int, world_size: int, init_method: str) -> None:
+    """Exercise the production logger on CPU DP source and non-source ranks."""
+    dist.init_process_group("gloo", init_method=init_method, rank=rank, world_size=world_size)
+
+    from megatron.core import mpu
+
+    args = SimpleNamespace(
+        use_wandb=True,
+        use_tensorboard=False,
+        wandb_always_use_train_step=False,
+        rollout_batch_size=2,
+        n_samples_per_prompt=1,
+        global_batch_size=2,
+    )
+    stats = RolloutStalenessStats(discarded=1, eligible=2, unknown_version=0)
+    rollout_data = {
+        "weight_versions": [["7"], ["9"]],
+        "loss_masks": [torch.ones(2, dtype=torch.int32), torch.ones(2, dtype=torch.int32)],
+    }
+
+    # Deliberately initialize W&B only where production code does: the DP
+    # source rank. A non-source wandb.log() would fail this worker.
+    if rank == 0:
+        wandb.init(mode="disabled", project="cpu-staleness-e2e", name="source")
+
+    try:
+        with (
+            patch.object(mpu, "get_tensor_model_parallel_rank", return_value=0),
+            patch.object(mpu, "is_pipeline_last_stage", return_value=True),
+            patch.object(mpu, "get_data_parallel_world_size", return_value=world_size),
+            patch.object(mpu, "get_data_parallel_src_rank", return_value=0),
+            patch.object(mpu, "get_data_parallel_group_gloo", return_value=dist.group.WORLD),
+        ):
+            log_rollout_weight_staleness_metrics(
+                rollout_id=1,
+                args=args,
+                stats=stats,
+                trainer_weight_version=10,
+                max_staleness=6,
+                num_steps_per_rollout=1,
+                rollout_data=rollout_data,
+            )
+    finally:
+        if rank == 0:
+            wandb.finish()
+        dist.destroy_process_group()
+
+
+@pytest.mark.integration
+def test_staleness_logger_cpu_e2e_skips_non_source_wandb_logging():
+    """The full staleness logger must work with W&B only on the DP source."""
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        port = sock.getsockname()[1]
+
+    mp.spawn(
+        _run_staleness_logger_cpu_worker,
+        args=(2, f"tcp://127.0.0.1:{port}"),
+        nprocs=2,
+        join=True,
+    )
 
 
 def test_min_rollout_weight_version_uses_oldest_version():

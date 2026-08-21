@@ -1,6 +1,6 @@
 # Salamandra-7B CISPO — prerequisites and downloads
 
-Checklist for running [Salamandra-7B CISPO async training](salamandra-7b-cispo.md) on MN5 with the shared VERL Singularity runtime. **Nothing in this file is downloaded automatically**; use it to prepare paths before `sbatch` or an interactive `salloc`.
+Checklist for running Salamandra-7B CISPO async training on MN5 with the shared VERL Singularity runtime. **Nothing in this file is downloaded automatically**; use it to prepare paths before `sbatch` or an interactive `salloc`.
 
 ## Already on GPFS (no internet download)
 
@@ -176,6 +176,5 @@ done
 
 ## Related docs
 
-- [Salamandra-7B CISPO training guide](salamandra-7b-cispo.md)
 - [slime quick start — model and dataset download](../get_started/quick_start.md#model-and-dataset-download)
 - MN5 runtime layout: `~/.codex/skills/mn5-singularity-runtime/references/runtime_layout.md`

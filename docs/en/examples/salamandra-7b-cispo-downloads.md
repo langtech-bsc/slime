@@ -14,7 +14,7 @@ These are expected to exist on MareNostrum 5 project storage. Verify paths befor
 | FlashAttention overlay | `.../rl_mn5_python3.12_20260206/lib/python3.12/flash_attn_site_packages` | Bind-mounted as `/flash_attn_site_packages` |
 | Runtime helpers | `/gpfs/projects/bsc88/text/models/vision/salamandra-rl-parent/Salamandra-rl/quick_start/runtime_env_common.sh` | Shared bind/env wiring |
 | Salamandra-7B HF weights | `/gpfs/projects/bsc88/text/models/BSC-NeMo-RL_prod_2026-03-20/results/sft/yolo-M4/hf-safetensors/Salamandra-7b_pre-1.4_sft-5.0_lr2e-5_bs256_warmup20` | Test model for this migration |
-| slime repo checkout | e.g. `/home/bsc/bsc474046/repositories/rl-training` (with `slime/` submodule) | Bind `RL_TRAINING_ROOT` and `SLIME_ROOT` at job launch |
+| slime repo checkout | e.g. `/home/bsc/${USER}/repositories/rl-training` (with `slime/` submodule) | Bind `RL_TRAINING_ROOT` and `SLIME_ROOT` at job launch |
 | Hugging Face hub cache (optional) | `/gpfs/scratch/bsc88/${USER}/.cache/huggingface` | Speeds up tokenizer/config loads |
 
 **Not used for this workflow:** GEM integration (`gem-llm` / `/gem_site_packages`). Do not install or bind GEM for the text-only CISPO run.

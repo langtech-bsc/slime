@@ -1691,7 +1691,16 @@ def parse_args(add_custom_arguments=None):
 
 
 def _apply_megatron_role_overrides(base_args, overrides, role):
-    role_args = copy.deepcopy(base_args)
+    # Runtime handles (for example the driver's offline W&B queue) are
+    # intentionally private and may not support deepcopy. Preserve them by
+    # reference while keeping normal argument values isolated per role.
+    private_args = {key: value for key, value in vars(base_args).items() if key.startswith("_")}
+    base_args_for_copy = copy.copy(base_args)
+    for key in private_args:
+        delattr(base_args_for_copy, key)
+    role_args = copy.deepcopy(base_args_for_copy)
+    for key, value in private_args.items():
+        setattr(role_args, key, value)
     ignored_keys = {"num_nodes", "num_gpus_per_node"}
 
     # Apply overrides from the YAML config.

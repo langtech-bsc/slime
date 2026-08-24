@@ -1,10 +1,12 @@
 import os
 
 import ray
+from ray.util.queue import Queue
 
 from slime.ray.placement_group import create_placement_groups, create_rollout_manager, create_training_models
 from slime.ray.utils import add_default_ray_env_vars
 from slime.utils.arguments import parse_args
+from slime.utils import logging_utils
 from slime.utils.logging_utils import configure_logger, finish_tracking, init_tracking
 from slime.utils.misc import should_run_periodic_action
 
@@ -28,6 +30,12 @@ def train(args):
     # allocate the GPUs
     pgs = create_placement_groups(args)
     init_tracking(args)
+    if args.use_wandb and (
+        args.wandb_mode == "offline" or os.environ.get("WANDB_MODE") == "offline"
+    ):
+        # Ray workers cannot append to the same offline W&B file. Give them a
+        # shared queue so the driver remains the only offline W&B writer.
+        args._wandb_metric_queue = Queue(maxsize=10000)
 
     # Start actor/critic initialization before waiting for external SGLang
     # discovery.  The MN5 launcher starts those servers concurrently; the
@@ -64,6 +72,7 @@ def train(args):
         # Sync the last generation
         if rollout_data_next_future is not None:
             rollout_payload_curr = ray.get(rollout_data_next_future)
+            logging_utils.drain_offline_wandb_queue(args)
 
         # Start the next rollout early.
         if rollout_id + 1 < args.num_rollout:
@@ -87,6 +96,7 @@ def train(args):
                 ray.get(value_refs)
         else:
             ray.get(actor_model.async_train(rollout_id, rollout_data_curr_ref))
+        logging_utils.drain_offline_wandb_queue(args)
 
         if should_run_periodic_action(rollout_id, args.save_interval, num_rollout_per_epoch, args.num_rollout):
             if (not args.use_critic) or rollout_id >= args.num_critic_only_steps:
@@ -110,8 +120,10 @@ def train(args):
 
         if should_run_periodic_action(rollout_id, args.eval_interval, num_rollout_per_epoch):
             ray.get(rollout_manager.eval.remote(rollout_id))
+            logging_utils.drain_offline_wandb_queue(args)
 
     ray.get(rollout_manager.dispose.remote())
+    logging_utils.drain_offline_wandb_queue(args)
     finish_tracking(args)
 
 

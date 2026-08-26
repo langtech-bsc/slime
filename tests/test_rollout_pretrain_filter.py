@@ -2,7 +2,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from slime.ray.rollout import _filter_rollout_groups_for_training
+from slime.ray.rollout import _filter_rollout_groups_for_training, _log_rollout_filter_data
 from slime.utils.types import Sample
 
 NUM_GPUS = 0
@@ -34,6 +34,27 @@ def make_sample_with_versions(index: int, versions: list[str]):
     sample = make_sample(index)
     sample.weight_versions = versions
     return sample
+
+
+def test_rollout_filter_logs_aggregate_staleness_warning(monkeypatch, caplog):
+    monkeypatch.setattr("slime.ray.rollout.compute_rollout_step", lambda _args, _rollout_id: 7)
+    monkeypatch.setattr("slime.ray.rollout.logging_utils.log", lambda *_args, **_kwargs: None)
+
+    with caplog.at_level("WARNING", logger="slime.ray.rollout"):
+        _log_rollout_filter_data(
+            3,
+            SimpleNamespace(),
+            {
+                "dropped_stale_samples": 4,
+                "original_samples": 64,
+                "kept_samples": 60,
+                "mean_rollout_weight_staleness": 5.5,
+                "max_rollout_weight_staleness": 8,
+            },
+        )
+
+    assert "dropped stale samples" in caplog.text
+    assert "dropped_stale_samples=4" in caplog.text
 
 
 @pytest.mark.unit

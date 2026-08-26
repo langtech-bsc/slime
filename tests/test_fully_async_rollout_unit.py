@@ -467,6 +467,16 @@ def test_fully_async_reward_queue_summary_includes_response_tokens(monkeypatch):
 
 
 @pytest.mark.unit
+def test_fully_async_metrics_expose_generated_and_rewarded_sample_counts():
+    from slime.rollout.fully_async_rollout import FullyAsyncMetrics
+
+    metrics = FullyAsyncMetrics(generated_samples=12, rewarded_samples=9)
+
+    assert metrics.snapshot()["fully_async/generated_samples"] == 12
+    assert metrics.snapshot()["fully_async/rewarded_samples"] == 9
+
+
+@pytest.mark.unit
 def test_fully_async_ignores_late_reward_for_dropped_group(monkeypatch, caplog):
     from slime.rollout import fully_async_rollout
 

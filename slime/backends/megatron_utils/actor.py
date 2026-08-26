@@ -441,8 +441,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.role == "critic":
             result = self.train_critic(rollout_id, rollout_data)
         else:
-            self.train_actor(rollout_id, rollout_data, external_data=external_data)
-            result = None
+            result = self.train_actor(rollout_id, rollout_data, external_data=external_data)
 
         if self.args.offload_train:
             del rollout_data
@@ -478,7 +477,7 @@ class MegatronTrainRayActor(TrainRayActor):
             return {"values": tensors_to_cpu(rollout_data["values"])}
         return {}
 
-    def train_actor(self, rollout_id: int, rollout_data: RolloutBatch, external_data=None) -> None:
+    def train_actor(self, rollout_id: int, rollout_data: RolloutBatch, external_data=None):
         # Create data iterator for log_probs and train.
         data_iterator = get_data_iterator(rollout_data)
         num_microbatches = rollout_data["num_microbatches"]
@@ -622,7 +621,9 @@ class MegatronTrainRayActor(TrainRayActor):
                     logger.info(f"Updating ref model at rollout_id {rollout_id}")
                 self.weights_backuper.backup("ref")
 
-        log_perf_data(rollout_id, self.args, extra_metrics=self.weight_updater.pop_metrics())
+        perf_metrics = self.weight_updater.pop_metrics()
+        perf_metrics["perf/effective_global_batch_size"] = sum(global_batch_sizes)
+        return log_perf_data(rollout_id, self.args, extra_metrics=perf_metrics)
 
     @timer
     def save_model(self, rollout_id: int, force_sync: bool = False) -> None:

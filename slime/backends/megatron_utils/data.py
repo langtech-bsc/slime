@@ -497,8 +497,12 @@ def log_passrate(rollout_id: int, args: Namespace, rollout_data: RolloutBatch) -
         gather_log_data("passrate", args, rollout_id, log_dict)
 
 
-def log_perf_data(rollout_id: int, args: Namespace, extra_metrics: dict | None = None) -> None:
-    train_metric_utils.log_perf_data_raw(
+def log_perf_data(
+    rollout_id: int,
+    args: Namespace,
+    extra_metrics: dict | None = None,
+) -> dict[str, float | int] | None:
+    return train_metric_utils.log_perf_data_raw(
         rollout_id=rollout_id,
         args=args,
         is_primary_rank=(

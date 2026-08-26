@@ -381,6 +381,33 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--fully-async-backpressure-rate-multiplier",
+                type=float,
+                default=0.95,
+                help=(
+                    "For slime.rollout.fully_async_rollout only: admit generation at this fraction "
+                    "of the slower measured reward/trainer sample rate."
+                ),
+            )
+            parser.add_argument(
+                "--fully-async-backpressure-rate-window-seconds",
+                type=float,
+                default=300.0,
+                help=(
+                    "For slime.rollout.fully_async_rollout only: rolling sample-rate measurement "
+                    "window. Must be at least 30 seconds."
+                ),
+            )
+            parser.add_argument(
+                "--fully-async-backpressure-high-watermark-samples",
+                type=int,
+                default=None,
+                help=(
+                    "For slime.rollout.fully_async_rollout only: soft reward/training queue limit in "
+                    "samples. Defaults to max(global_batch_size, rollout_batch_size * n_samples_per_prompt)."
+                ),
+            )
+            parser.add_argument(
                 "--rollout-temperature",
                 type=float,
                 default=1.0,

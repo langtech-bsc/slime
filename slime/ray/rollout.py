@@ -1204,6 +1204,17 @@ def _log_rollout_filter_data(rollout_id: int, args, metrics: dict[str, float | i
     if not metrics:
         return
     logger.info("rollout_filter %s: %s", rollout_id, metrics)
+    if metrics.get("dropped_stale_samples", 0):
+        logger.warning(
+            "rollout_filter %s dropped stale samples: dropped_stale_samples=%s "
+            "original_samples=%s kept_samples=%s mean_staleness=%s max_staleness=%s",
+            rollout_id,
+            metrics["dropped_stale_samples"],
+            metrics.get("original_samples"),
+            metrics.get("kept_samples"),
+            metrics.get("mean_rollout_weight_staleness"),
+            metrics.get("max_rollout_weight_staleness"),
+        )
     payload = {f"rollout_filter/{key}": value for key, value in metrics.items()}
     payload["rollout/step"] = compute_rollout_step(args, rollout_id)
     logging_utils.log(args, payload, step_key="rollout/step")

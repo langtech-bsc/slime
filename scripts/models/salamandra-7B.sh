@@ -15,6 +15,8 @@ MODEL_ARGS=(
    --vocab-size 256000
    --kv-channels 128
    --use-rope-scaling
-   --rotary-scaling-factor 20.0
+   --rope-scaling-factor 20.0
+   --attention-dropout 0.0
+   --hidden-dropout 0.0
    --untie-embeddings-and-output-weights
 )

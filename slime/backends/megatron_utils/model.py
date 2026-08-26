@@ -280,6 +280,7 @@ def forward_only(
     num_microbatches: Sequence[int],
     store_prefix: str = "",
     use_rollout_top_p_replay: bool = False,
+    train_mode: bool = False,
 ) -> dict[str, list[torch.Tensor]]:
     """Run forward passes only and collect non-loss outputs (e.g., logprobs).
 
@@ -301,6 +302,8 @@ def forward_only(
         store_prefix (str): Prefix to prepend to stored output keys.
         use_rollout_top_p_replay (bool): Whether to pass rollout top-p token sets
             to the post-forward log-prob callback when top-p rollout is enabled.
+        train_mode (bool): If True, keep dropout enabled (the CISPO train
+            forward). Default False matches the eval-mode logprob recompute.
 
     Returns:
         dict[str, list[torch.Tensor]]: Aggregated outputs keyed by ``store_prefix + key``.
@@ -374,9 +377,10 @@ def forward_only(
 
         return output_tensor, partial(f, **output_kwargs)
 
-    # Turn on evaluation mode which disables dropout.
+    # Evaluation mode disables dropout. CISPO may reuse the train forward as
+    # old_log_probs, so probes can request train_mode=True to match that path.
     for model_module in model:
-        model_module.eval()
+        model_module.train(train_mode)
 
     if args.custom_megatron_before_log_prob_hook_path:
         from slime.utils.misc import load_function

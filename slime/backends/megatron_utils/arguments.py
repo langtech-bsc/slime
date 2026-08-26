@@ -152,7 +152,10 @@ def _set_default_megatron_args(args):
     # placeholders
     if args.seq_length is None:
         args.seq_length = 4096
-    args.max_position_embeddings = args.seq_length
+    # seq_length is a Megatron pack/buffer placeholder for variable-length RL.
+    # Do not overwrite a model-script context length (Salamandra is 163840).
+    if getattr(args, "max_position_embeddings", None) in (None, 0):
+        args.max_position_embeddings = args.seq_length
     # TODO: revisit this when megatron(dev) have solved the optimizer-cpu-offload ckpt saving bug
     args.dist_ckpt_save_pre_mcore_014 = True
     # compatible for megatron

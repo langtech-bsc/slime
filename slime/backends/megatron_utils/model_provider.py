@@ -211,6 +211,9 @@ def _get_model_provider_func(
             "rotary_percent": args.rotary_percent,
             "rotary_base": args.rotary_base,
             "rope_scaling": args.use_rope_scaling,
+            # Llama-3.x interpolation factor. Distinct from --rotary-scaling-factor
+            # (YaRN/MLA). GPTModel defaults to 8.0 if this is omitted.
+            "rope_scaling_factor": args.rope_scaling_factor,
         }
 
         if vp_stage is not None:

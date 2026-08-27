@@ -32,9 +32,12 @@ class RolloutPipelineWandbMonitor:
         self,
         queue_snapshot: QueueDepthSnapshot,
         reward_snapshot: RewardComputationSnapshot,
+        extra_metrics: dict[str, float | int] | None = None,
     ) -> None:
         if not getattr(self.args, "use_wandb", False):
             return
         self._snapshot_index += 1
         payload = merge_rollout_pipeline_wandb_dict(queue_snapshot, reward_snapshot)
+        if extra_metrics:
+            payload.update(extra_metrics)
         logging_utils.log(self.args, payload, step=self._snapshot_index)

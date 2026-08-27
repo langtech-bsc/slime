@@ -30,11 +30,19 @@ import atexit
 from collections import deque
 from dataclasses import dataclass, field
 import logging
+import math
+from queue import Empty
 import threading
 import time
 import uuid
 
 from slime.rollout.base_types import RolloutFnTrainOutput
+from slime.rollout.fully_async_backpressure import (
+    AdaptiveBackpressureController,
+    DEFAULT_RATE_MULTIPLIER,
+    DEFAULT_RATE_WINDOW_SECONDS,
+    WARNING_INTERVAL_SECONDS,
+)
 from slime.rollout.queue_metrics import TrainingOutputQueue, compute_queue_depth
 from slime.rollout.reward_computation_metrics import (
     RewardComputationTracker,
@@ -49,12 +57,12 @@ from slime.utils.trace_utils import trace_span
 from slime.utils.types import Sample
 
 __all__ = [
+    "AdaptiveBackpressureController",
     "AsyncRolloutWorker",
     "generate_rollout_fully_async",
 ]
 
 logger = logging.getLogger("slime.rollout.fully_async")
-
 
 # Global worker, shared across rollout calls so the queue stays warm.
 _global_worker: AsyncRolloutWorker | None = None
@@ -78,6 +86,24 @@ def _get_global_worker(args, data_buffer) -> AsyncRolloutWorker:
             )
             max_inference_groups = args.fully_async_max_inference_groups
             max_reward_groups = args.fully_async_max_reward_groups
+            rate_multiplier = getattr(
+                args,
+                "fully_async_backpressure_rate_multiplier",
+                DEFAULT_RATE_MULTIPLIER,
+            )
+            rate_window_seconds = getattr(
+                args,
+                "fully_async_backpressure_rate_window_seconds",
+                DEFAULT_RATE_WINDOW_SECONDS,
+            )
+            high_watermark_samples = getattr(
+                args,
+                "fully_async_backpressure_high_watermark_samples",
+                None,
+            ) or max(
+                getattr(args, "global_batch_size", 0) or 0,
+                args.rollout_batch_size * args.n_samples_per_prompt,
+            )
             if (
                 generation_concurrency < 1
                 or reward_concurrency < 1
@@ -107,6 +133,10 @@ def _get_global_worker(args, data_buffer) -> AsyncRolloutWorker:
                 reward_frontier_groups=reward_frontier_groups,
                 max_inference_groups=max_inference_groups,
                 max_reward_groups=max_reward_groups,
+                backpressure_rate_multiplier=rate_multiplier,
+                backpressure_rate_window_seconds=rate_window_seconds,
+                backpressure_high_watermark_samples=high_watermark_samples,
+                trainer_perf_queue=getattr(args, "_fully_async_trainer_perf_queue", None),
             )
             _global_worker.start()
         return _global_worker
@@ -161,6 +191,10 @@ class AsyncRolloutWorker:
         reward_frontier_groups: int | None = None,
         max_inference_groups: int = 8,
         max_reward_groups: int = 8,
+        backpressure_rate_multiplier: float = DEFAULT_RATE_MULTIPLIER,
+        backpressure_rate_window_seconds: float = DEFAULT_RATE_WINDOW_SECONDS,
+        backpressure_high_watermark_samples: int | None = None,
+        trainer_perf_queue=None,
     ):
         self.args = args
         self.data_buffer = data_buffer
@@ -174,6 +208,16 @@ class AsyncRolloutWorker:
         self.training_output_queue = TrainingOutputQueue()
         self.reward_computation_tracker = RewardComputationTracker()
         self.pipeline_wandb_monitor = RolloutPipelineWandbMonitor(args)
+        high_watermark_samples = backpressure_high_watermark_samples or max(
+            getattr(args, "global_batch_size", 0) or 0,
+            args.rollout_batch_size * args.n_samples_per_prompt,
+        )
+        self.backpressure = AdaptiveBackpressureController(
+            rate_multiplier=backpressure_rate_multiplier,
+            rate_window_seconds=backpressure_rate_window_seconds,
+            high_watermark_samples=high_watermark_samples,
+        )
+        self.trainer_perf_queue = trainer_perf_queue
         self.worker_thread: threading.Thread | None = None
         self.state = GenerateState(args)
         self.metrics = FullyAsyncMetrics()
@@ -197,7 +241,10 @@ class AsyncRolloutWorker:
         return self.training_output_queue.group_count()
 
     def collect_metrics(self) -> dict[str, float | int]:
-        return self.metrics.snapshot()
+        metrics = self.metrics.snapshot()
+        metrics.update(self.backpressure.snapshot())
+        metrics["fully_async/training_output_queue_samples"] = self.training_output_queue.sample_count
+        return metrics
 
     # -- internals -----------------------------------------------------------
 
@@ -213,6 +260,12 @@ class AsyncRolloutWorker:
         groups: dict[int, GroupState] = {}
         warned_high_backlog = False
         last_reward_queue_log = 0.0
+        last_rate_log_at = time.time()
+        last_generated_samples = 0
+        last_rewarded_samples = 0
+        last_trainer_perf_poll = 0.0
+        last_backpressure_warning = 0.0
+        previous_pressure_reasons: tuple[str, ...] = ()
 
         while self.running:
             try:
@@ -226,16 +279,40 @@ class AsyncRolloutWorker:
 
                 self._publish_ready_groups(groups)
                 self._refresh_backlog_metrics(groups)
+                now = time.time()
+                monotonic_now = time.monotonic()
+                if now - last_trainer_perf_poll >= 1.0:
+                    self._drain_trainer_performance_reports()
+                    last_trainer_perf_poll = now
+                self.backpressure.observe_queues(
+                    reward_samples=self.metrics.reward_backlog_samples,
+                    training_samples=self.training_output_queue.sample_count,
+                )
+                self.backpressure.observe_reward_capacity(
+                    saturated=bool(pending_reward)
+                    or len(active_reward) >= max(1, math.ceil(0.9 * self.reward_concurrency)),
+                    now=monotonic_now,
+                )
                 self.metrics.inference_active_groups = len(
                     _inference_active_group_ids(groups, pending_generation, active_generation)
                 )
                 serving_gids = _reward_serving_group_ids(groups)
                 self.metrics.reward_active_groups = len(serving_gids)
                 warned_high_backlog = self._maybe_log_backlog_warning(groups, warned_high_backlog)
-                now = time.time()
                 if now - last_reward_queue_log >= 30.0:
+                    rate_elapsed = max(now - last_rate_log_at, 1e-6)
+                    rollout_samples_per_s = (
+                        self.metrics.generated_samples - last_generated_samples
+                    ) / rate_elapsed
+                    reward_samples_per_s = (
+                        self.metrics.rewarded_samples - last_rewarded_samples
+                    ) / rate_elapsed
                     logger.info(
-                        "fully-async reward queues reason=periodic %s",
+                        "fully-async reward queues reason=periodic "
+                        "rollout_samples_per_s=%.2f reward_computation_samples_per_s=%.2f %s %s",
+                        rollout_samples_per_s,
+                        reward_samples_per_s,
+                        self._backpressure_summary(monotonic_now),
                         self._reward_queue_summary(
                             groups=groups,
                             pending_reward=pending_reward,
@@ -258,8 +335,40 @@ class AsyncRolloutWorker:
                             oldest_wait_seconds=self.metrics.reward_oldest_pending_seconds,
                             tracker=self.reward_computation_tracker,
                         ),
+                        extra_metrics=self.backpressure.snapshot(now=monotonic_now),
                     )
                     last_reward_queue_log = now
+                    last_rate_log_at = now
+                    last_generated_samples = self.metrics.generated_samples
+                    last_rewarded_samples = self.metrics.rewarded_samples
+                pressure_reasons = self.backpressure.pressure_reasons(now=monotonic_now)
+                if pressure_reasons and (
+                    pressure_reasons != previous_pressure_reasons
+                    or now - last_backpressure_warning >= WARNING_INTERVAL_SECONDS
+                ):
+                    logger.warning(
+                        "fully-async generation backpressure reasons=%s %s oldest_pending=%.1fs "
+                        "reward_backlog_samples=%s training_queue_samples=%s generation_concurrency=%s "
+                        "reward_concurrency=%s",
+                        ",".join(pressure_reasons),
+                        self._backpressure_summary(monotonic_now),
+                        self.metrics.reward_oldest_pending_seconds,
+                        self.metrics.reward_backlog_samples,
+                        self.training_output_queue.sample_count,
+                        self.generation_concurrency,
+                        self.reward_concurrency,
+                    )
+                    last_backpressure_warning = now
+                elif previous_pressure_reasons and not pressure_reasons:
+                    logger.warning(
+                        "fully-async generation backpressure recovered previous_reasons=%s %s "
+                        "reward_backlog_samples=%s training_queue_samples=%s",
+                        ",".join(previous_pressure_reasons),
+                        self._backpressure_summary(monotonic_now),
+                        self.metrics.reward_backlog_samples,
+                        self.training_output_queue.sample_count,
+                    )
+                previous_pressure_reasons = pressure_reasons
                 self._drop_over_backlog_groups(
                     groups,
                     pending_reward=pending_reward,
@@ -283,6 +392,8 @@ class AsyncRolloutWorker:
                     serving_gids = _reward_serving_group_ids(groups)
 
                 while len(active_generation) < self.generation_concurrency and self.running:
+                    if self.backpressure.queue_pause_reasons:
+                        break
                     while not pending_generation:
                         if (
                             len(_inference_active_group_ids(groups, pending_generation, active_generation))
@@ -301,6 +412,8 @@ class AsyncRolloutWorker:
                                 sample.session_id = str(uuid.uuid4())
                             pending_generation.append((gid, sample_idx, sample))
                     if not pending_generation:
+                        break
+                    if not self.backpressure.try_admit(now=time.monotonic()):
                         break
 
                     gid, sample_idx, sample = pending_generation.popleft()
@@ -356,6 +469,9 @@ class AsyncRolloutWorker:
 
         group.generated_units[sample_idx] = generated
         group.generated_count += 1
+        generated_count = _sample_count(generated)
+        self.metrics.generated_samples += generated_count
+        self.backpressure.record_generated(generated_count)
         if _contains_aborted(generated):
             group.dropped = True
             for sample in group.samples:
@@ -413,9 +529,13 @@ class AsyncRolloutWorker:
         if sample_idx is None:
             group.generated_units = list(rewarded)
             group.rewarded_count = len(group.samples)
+            self.metrics.rewarded_samples += len(group.samples)
+            self.backpressure.record_rewarded(len(group.samples))
         else:
             group.generated_units[sample_idx] = rewarded
             group.rewarded_count += 1
+            self.metrics.rewarded_samples += 1
+            self.backpressure.record_rewarded(1)
 
     def _pop_next_pending_reward(
         self,
@@ -497,6 +617,9 @@ class AsyncRolloutWorker:
             if any(item is None for item in result):
                 logger.error("fully-async: refusing to publish incomplete group gid=%s", gid)
                 continue
+            self.reward_computation_tracker.record_group_rewards(
+                sample.get_reward_value(self.args) for sample in result
+            )
             self.training_output_queue.put(gid, result)
 
     def _refresh_backlog_metrics(self, groups: dict[int, "GroupState"]) -> None:
@@ -506,6 +629,39 @@ class AsyncRolloutWorker:
         self.metrics.reward_oldest_pending_seconds = max(
             (time.time() - group.created_at for group in backlogged),
             default=0.0,
+        )
+
+    def _drain_trainer_performance_reports(self) -> None:
+        if self.trainer_perf_queue is None:
+            return
+        latest = None
+        while True:
+            try:
+                latest = self.trainer_perf_queue.get_nowait()
+            except Empty:
+                break
+        if latest is None:
+            return
+        valid = self.backpressure.report_trainer_performance(
+            step_time=latest.get("perf/step_time"),
+            effective_batch_size=latest.get("perf/effective_global_batch_size"),
+        )
+        if not valid:
+            logger.warning("fully-async ignored invalid trainer performance report: %s", latest)
+
+    def _backpressure_summary(self, now: float) -> str:
+        snapshot = self.backpressure.snapshot(now=now)
+        return (
+            "backpressure_generation_samples_per_s="
+            f"{snapshot['fully_async/generation_samples_per_s']:.2f} "
+            "backpressure_reward_samples_per_s="
+            f"{snapshot['fully_async/reward_samples_per_s']:.2f} "
+            f"reward_capacity_samples_per_s={snapshot['fully_async/reward_capacity_samples_per_s']:.2f} "
+            f"trainer_samples_per_s={snapshot['fully_async/trainer_samples_per_s']:.2f} "
+            f"target_generation_samples_per_s={snapshot['fully_async/target_generation_samples_per_s']:.2f} "
+            f"rate_window_seconds={self.backpressure.rate_window_seconds:.0f} "
+            f"warmup={snapshot['fully_async/backpressure_warmup']} "
+            f"paused={snapshot['fully_async/backpressure_paused']}"
         )
 
     def _reward_queue_summary(
@@ -522,7 +678,7 @@ class AsyncRolloutWorker:
             len(sample_or_group) if isinstance(sample_or_group, list) else 1
             for _gid, _sample_idx, sample_or_group in pending_reward
         )
-        active_reward_groups = len({gid for _task, (gid, _sample_idx) in active_reward.items()})
+        active_reward_task_groups = len({gid for _task, (gid, _sample_idx) in active_reward.items()})
         active_reward_samples = sum(
             len(groups[gid].samples) if sample_idx is None and gid in groups else 1
             for _task, (gid, sample_idx) in active_reward.items()
@@ -531,7 +687,9 @@ class AsyncRolloutWorker:
             max(group.generated_count - group.rewarded_count - group.active_reward_count, 0)
             for group in waiting
         )
-        active_or_scheduled_samples = sum(group.active_reward_count for group in waiting)
+        scheduled_unrewarded_samples = sum(
+            max(group.reward_scheduled_count - group.rewarded_count, 0) for group in waiting
+        )
         response_lengths = [
             length
             for group in waiting
@@ -557,15 +715,15 @@ class AsyncRolloutWorker:
             f"groups_total={len(groups)} waiting_groups={len(waiting)} "
             f"waiting_samples={self.metrics.reward_backlog_samples} "
             f"pending_reward_items={len(pending_reward)} pending_reward_samples={pending_reward_samples} "
-            f"active_reward_tasks={len(active_reward)} active_reward_groups={active_reward_groups} "
+            f"active_reward_tasks={len(active_reward)} active_reward_task_groups={active_reward_task_groups} "
             f"active_reward_samples={active_reward_samples} unscheduled_samples={unscheduled_samples} "
-            f"active_or_scheduled_samples={active_or_scheduled_samples} "
+            f"scheduled_unrewarded_samples={scheduled_unrewarded_samples} "
             f"response_tokens={response_token_summary} "
             f"output_queue_groups={self.training_output_queue.group_count()} active_generation={len(active_generation)} "
             f"pending_generation_samples={len(pending_generation)} "
             f"inference_active_groups={self.metrics.inference_active_groups} "
             f"inference_limit_groups={self.max_inference_groups} "
-            f"reward_active_groups={self.metrics.reward_active_groups} "
+            f"reward_serving_groups={self.metrics.reward_active_groups} "
             f"reward_limit_groups={self.max_reward_groups} "
             f"limit_groups={self.max_reward_backlog_groups} "
             f"oldest(gid,gen,scheduled,active,rewarded)={oldest} "
@@ -781,6 +939,8 @@ class FullyAsyncMetrics:
     generation_failed_groups: int = 0
     generation_invalid_groups: int = 0
     reward_failed_groups: int = 0
+    generated_samples: int = 0
+    rewarded_samples: int = 0
 
     def snapshot(self) -> dict[str, float | int]:
         return {
@@ -794,6 +954,8 @@ class FullyAsyncMetrics:
             "fully_async/generation_failed_groups": self.generation_failed_groups,
             "fully_async/generation_invalid_groups": self.generation_invalid_groups,
             "fully_async/reward_failed_groups": self.reward_failed_groups,
+            "fully_async/generated_samples": self.generated_samples,
+            "fully_async/rewarded_samples": self.rewarded_samples,
         }
 
 
@@ -801,6 +963,10 @@ def _contains_aborted(sample_or_group: Sample | list[Sample]) -> bool:
     if isinstance(sample_or_group, list):
         return any(getattr(sample, "status", None) == Sample.Status.ABORTED for sample in sample_or_group)
     return getattr(sample_or_group, "status", None) == Sample.Status.ABORTED
+
+
+def _sample_count(sample_or_group: Sample | list[Sample]) -> int:
+    return len(sample_or_group) if isinstance(sample_or_group, list) else 1
 
 
 def _iter_samples(sample_or_group: Sample | list[Sample]):

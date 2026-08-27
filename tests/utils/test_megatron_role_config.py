@@ -188,3 +188,54 @@ class TestMegatronRoleConfig:
         assert actor_model.init_calls[0]["args"].lr == 1e-6
         assert actor_model.init_calls[0]["role"] == "actor"
         assert args.start_rollout_id == 7
+
+    def test_create_training_models_resolves_num_rollout_before_init(self, monkeypatch):
+        from slime.ray import placement_group as placement_group_module
+
+        args = _base_args(
+            megatron_config_path=None,
+            use_critic=False,
+            num_rollout=None,
+            num_epoch=2,
+            rollout_batch_size=4,
+            data_source_path="fake.DataSource",
+            rollout_global_dataset=True,
+        )
+
+        class FakeDataSource:
+            def __init__(self, source_args):
+                self.args = source_args
+
+            def __len__(self):
+                return 8
+
+        class DummyModel:
+            def __init__(self, model_args):
+                self.args = model_args
+                self.init_calls = []
+                self.rollout_manager = None
+
+            def async_init(self, model_args, role, with_ref=False, with_opd_teacher=False):
+                self.args = model_args
+                self.init_calls.append({"args": model_args, "role": role})
+                return [0]
+
+            def set_rollout_manager(self, rollout_manager):
+                self.rollout_manager = rollout_manager
+
+        def fake_allocate_train_group(args, num_nodes, num_gpus_per_node, pg, role="actor"):
+            return DummyModel(args)
+
+        monkeypatch.setattr(placement_group_module, "allocate_train_group", fake_allocate_train_group)
+        monkeypatch.setattr(placement_group_module.ray, "get", lambda value: value)
+        monkeypatch.setattr("slime.utils.misc.load_function", lambda path: FakeDataSource)
+
+        actor_model, critic_model = placement_group_module.create_training_models(
+            args,
+            {"actor": None, "critic": None},
+            object(),
+        )
+
+        assert critic_model is None
+        assert args.num_rollout == 4
+        assert actor_model.init_calls[0]["args"].num_rollout == 4

@@ -15,12 +15,14 @@ def test_reward_computation_snapshot_to_wandb_dict():
         concurrency_utilization=0.75,
         oldest_wait_seconds=12.5,
         rm_latency_mean=0.42,
+        group_reward_std_mean=0.13,
     )
     payload = snapshot.to_wandb_dict()
     assert payload == {
         "reward_computation/concurrency_utilization": 0.75,
         "reward_computation/oldest_wait_seconds": 12.5,
         "reward_computation/rm_latency_mean": 0.42,
+        "reward_computation/group_reward_std_mean": 0.13,
     }
 
 
@@ -53,6 +55,17 @@ def test_reward_computation_tracker_window_resets_after_consume():
 
 
 @pytest.mark.unit
+def test_reward_computation_tracker_records_mean_group_reward_std():
+    tracker = RewardComputationTracker()
+    tracker.record_group_rewards([0.0, 1.0])
+    tracker.record_group_rewards([0.0, 0.0, 1.0])
+    expected = (0.5 + (2.0 / 9.0) ** 0.5) / 2.0
+
+    assert tracker.consume_window_mean_group_reward_std() == pytest.approx(expected)
+    assert tracker.consume_window_mean_group_reward_std() is None
+
+
+@pytest.mark.unit
 def test_build_reward_computation_snapshot():
     tracker = RewardComputationTracker()
     tracker.record_rm_latency(0.2)
@@ -68,3 +81,4 @@ def test_build_reward_computation_snapshot():
     assert snapshot.concurrency_utilization == 0.25
     assert snapshot.oldest_wait_seconds == 7.0
     assert snapshot.rm_latency_mean == pytest.approx(0.3)
+    assert snapshot.group_reward_std_mean is None

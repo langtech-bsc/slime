@@ -4,13 +4,12 @@ import logging
 import multiprocessing
 import os
 import time
+from typing import TYPE_CHECKING
 from urllib.parse import quote
 
 import requests
 import sglang_router
 from packaging.version import parse
-from sglang.srt.server_args import ServerArgs
-from sglang.srt.utils import kill_process_tree
 from urllib3.exceptions import NewConnectionError
 
 from slime.backends.sglang_utils.external import get_server_info
@@ -18,6 +17,16 @@ from slime.ray.ray_actor import RayActor
 from slime.utils.http_utils import get_host_info
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from sglang.srt.server_args import ServerArgs
+
+
+def _get_server_args_cls():
+    """Import SGLang only when this actor must launch a local engine."""
+    from sglang.srt.server_args import ServerArgs
+
+    return ServerArgs
 
 
 def get_base_gpu_id(args, rank):
@@ -48,7 +57,7 @@ def _to_local_gpu_id(physical_gpu_id: int) -> int:
     )
 
 
-def launch_server_process(server_args: ServerArgs) -> multiprocessing.Process:
+def launch_server_process(server_args) -> multiprocessing.Process:
     if getattr(server_args, "encoder_only", False):
         from sglang.srt.disaggregation.encode_server import launch_server_process as sglang_launch_server_process
 
@@ -178,13 +187,25 @@ class SGLangEngine(RayActor):
                     actual_value == expect_value
                 ), f"{name=} {expect_value=} {actual_value=} {expect_server_args=} {actual_server_args=}"
 
-        actual_server_args = get_server_info(f"http://{self.server_host}:{self.server_port}")
-        _sanity_check_server_args(actual_server_args, expect_server_args)
+        server_url = f"http://{self.server_host}:{self.server_port}"
+        if os.environ.get("SLIME_EXTERNAL_ENGINE_SKIP_SERVER_INFO_CHECK") == "1":
+            timeout = float(os.environ.get("SLIME_EXTERNAL_ENGINE_HEALTH_TIMEOUT_S", "10"))
+            response = requests.get(f"{server_url}/health", timeout=timeout)
+            response.raise_for_status()
+            logger.info(
+                "External SGLang engine passed /health; skipping /server_info "
+                "sanity check (rank=%d, url=%s)",
+                self.rank,
+                server_url,
+            )
+        else:
+            actual_server_args = get_server_info(server_url)
+            _sanity_check_server_args(actual_server_args, expect_server_args)
         self._register_to_router(expect_server_args)
 
     def _init_normal(self, server_args_dict):
         logger.info(f"Launch HttpServerEngineAdapter at: {self.server_host}:{self.server_port}")
-        self.process = launch_server_process(ServerArgs(**server_args_dict))
+        self.process = launch_server_process(_get_server_args_cls()(**server_args_dict))
         self._register_to_router(server_args_dict)
 
     def _register_to_router(self, server_args_dict):
@@ -344,7 +365,10 @@ class SGLangEngine(RayActor):
 
             if response is not None:
                 response.raise_for_status()
-        kill_process_tree(self.process.pid)
+        if getattr(self, "process", None) is not None:
+            from sglang.srt.utils import kill_process_tree
+
+            kill_process_tree(self.process.pid)
 
     def get_weight_version(self):
         if self.node_rank != 0:
@@ -609,7 +633,12 @@ def _compute_server_args(
         kwargs["dtype"] = "float16"
     external_engine_need_check_fields = [k for k in kwargs.keys() if k not in _EXTERNAL_ENGINE_SKIP_CHECK_FIELDS]
 
-    server_arg_fields = dataclasses.fields(ServerArgs)
+    # External engines already own their ServerArgs.  Do not import SGLang on
+    # the trainer merely to enumerate local-server-only configuration fields.
+    if args.rollout_external:
+        return kwargs, external_engine_need_check_fields
+
+    server_arg_fields = dataclasses.fields(_get_server_args_cls())
     server_arg_field_names = {attr.name for attr in server_arg_fields}
     unused_keys = set(kwargs.keys())
     for attr in server_arg_fields:

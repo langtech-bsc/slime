@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import asyncio
-import time
+from collections.abc import Iterable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from statistics import fmean, pstdev
+import time
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -23,6 +25,7 @@ class RewardComputationSnapshot:
     concurrency_utilization: float
     oldest_wait_seconds: float
     rm_latency_mean: float | None
+    group_reward_std_mean: float | None = None
 
     def to_wandb_dict(self) -> dict[str, float]:
         payload = {
@@ -31,6 +34,8 @@ class RewardComputationSnapshot:
         }
         if self.rm_latency_mean is not None:
             payload["reward_computation/rm_latency_mean"] = self.rm_latency_mean
+        if self.group_reward_std_mean is not None:
+            payload["reward_computation/group_reward_std_mean"] = self.group_reward_std_mean
         return payload
 
 
@@ -40,6 +45,7 @@ class RewardComputationTracker:
     def __init__(self) -> None:
         self._rm_latency_total_s = 0.0
         self._rm_latency_count = 0
+        self._group_reward_std_values: list[float] = []
 
     def record_rm_latency(self, duration_s: float) -> None:
         self._rm_latency_total_s += duration_s
@@ -51,6 +57,20 @@ class RewardComputationTracker:
         mean = self._rm_latency_total_s / self._rm_latency_count
         self._rm_latency_total_s = 0.0
         self._rm_latency_count = 0
+        return mean
+
+    def record_group_rewards(self, rewards: Iterable[float]) -> None:
+        """Record one completed group's population reward standard deviation."""
+        values = [float(reward) for reward in rewards]
+        if len(values) < 2:
+            return
+        self._group_reward_std_values.append(pstdev(values))
+
+    def consume_window_mean_group_reward_std(self) -> float | None:
+        if not self._group_reward_std_values:
+            return None
+        mean = fmean(self._group_reward_std_values)
+        self._group_reward_std_values.clear()
         return mean
 
     @asynccontextmanager
@@ -74,4 +94,5 @@ def build_reward_computation_snapshot(
         concurrency_utilization=utilization,
         oldest_wait_seconds=oldest_wait_seconds,
         rm_latency_mean=tracker.consume_window_mean_latency(),
+        group_reward_std_mean=tracker.consume_window_mean_group_reward_std(),
     )

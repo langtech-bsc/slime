@@ -13,7 +13,15 @@ import numpy as np
 import ray
 import torch
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
-from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
+# External rollout engines run in a separate SGLang image.  The trainer only
+# uses these values as tags when it owns local engines, so retain the canonical
+# string values when SGLang is intentionally absent from the trainer runtime.
+try:
+    from sglang.srt.constants import GPU_MEMORY_TYPE_CUDA_GRAPH, GPU_MEMORY_TYPE_KV_CACHE, GPU_MEMORY_TYPE_WEIGHTS
+except ModuleNotFoundError:
+    GPU_MEMORY_TYPE_CUDA_GRAPH = "cuda_graph"
+    GPU_MEMORY_TYPE_KV_CACHE = "kv_cache"
+    GPU_MEMORY_TYPE_WEIGHTS = "weights"
 
 from slime.backends.sglang_utils.external import start_external_rollout_servers
 from slime.backends.sglang_utils.sglang_config import ModelConfig, ServerGroupConfig, SglangConfig
@@ -1213,6 +1221,17 @@ def _log_rollout_filter_data(rollout_id: int, args, metrics: dict[str, float | i
     if not metrics:
         return
     logger.info("rollout_filter %s: %s", rollout_id, metrics)
+    if metrics.get("dropped_stale_samples", 0):
+        logger.warning(
+            "rollout_filter %s dropped stale samples: dropped_stale_samples=%s "
+            "original_samples=%s kept_samples=%s mean_staleness=%s max_staleness=%s",
+            rollout_id,
+            metrics["dropped_stale_samples"],
+            metrics.get("original_samples"),
+            metrics.get("kept_samples"),
+            metrics.get("mean_rollout_weight_staleness"),
+            metrics.get("max_rollout_weight_staleness"),
+        )
     payload = {f"rollout_filter/{key}": value for key, value in metrics.items()}
     payload["rollout/step"] = compute_rollout_step(args, rollout_id)
     logging_utils.log(args, payload, step_key="rollout/step")

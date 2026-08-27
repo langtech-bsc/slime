@@ -429,5 +429,27 @@ def test_update_weight_delta_rejects_unknown_transport(monkeypatch):
         module._validate_update_weight_args(args)
 
 
+@pytest.mark.unit
+def test_set_default_megatron_args_preserves_model_max_position_embeddings(monkeypatch):
+    module = load_arguments_module(monkeypatch)
+    args = types.SimpleNamespace(
+        fp16=False,
+        seq_length=None,
+        max_position_embeddings=163840,
+        rope_type="rope",
+        multi_latent_attention=False,
+        vocab_size=None,
+        padded_vocab_size=256000,
+        tokenizer_model="/tmp/tok",
+        tokenizer_type="HuggingFaceTokenizer",
+        hf_checkpoint="/tmp/hf",
+    )
+
+    module._set_default_megatron_args(args)
+
+    assert args.seq_length == 4096
+    assert args.max_position_embeddings == 163840
+
+
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__]))

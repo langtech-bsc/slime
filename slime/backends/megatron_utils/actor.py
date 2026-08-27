@@ -723,8 +723,7 @@ class MegatronTrainRayActor(TrainRayActor):
         if self.role == "critic":
             result = self.train_critic(rollout_id, rollout_data)
         else:
-            self.train_actor(rollout_id, rollout_data, external_data=external_data)
-            result = None
+            result = self.train_actor(rollout_id, rollout_data, external_data=external_data)
 
         if self.args.offload_train:
             del rollout_data
@@ -760,7 +759,7 @@ class MegatronTrainRayActor(TrainRayActor):
             return {"values": tensors_to_cpu(rollout_data["values"])}
         return {}
 
-    def train_actor(self, rollout_id: int, rollout_data: RolloutBatch, external_data=None) -> None:
+    def train_actor(self, rollout_id: int, rollout_data: RolloutBatch, external_data=None):
         async_opd = self.args.use_opd and self.args.opd_type == "megatron_async"
         opd_metrics = {}
         if async_opd:
@@ -792,6 +791,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 hidden_states[row, :response_length]
                 for row, response_length in enumerate(rollout_data["response_lengths"])
             ]
+
 
         # Create data iterator for log_probs and train.
         data_iterator = get_data_iterator(rollout_data)
@@ -974,7 +974,8 @@ class MegatronTrainRayActor(TrainRayActor):
 
         perf_metrics = self.weight_updater.pop_metrics()
         perf_metrics.update(opd_metrics)
-        log_perf_data(rollout_id, self.args, extra_metrics=perf_metrics)
+        perf_metrics["perf/effective_global_batch_size"] = sum(global_batch_sizes)
+        return log_perf_data(rollout_id, self.args, extra_metrics=perf_metrics)
 
     @timer
     def save_model(self, rollout_id: int, force_sync: bool = False) -> None:

@@ -47,7 +47,7 @@ def test_rollout_pipeline_wandb_monitor_maybe_log():
     )
 
     with patch("slime.utils.logging_utils.log") as mock_log:
-        monitor.maybe_log(queue, reward)
+        monitor.maybe_log(queue, reward, extra_metrics={"fully_async/backpressure_paused": 1})
 
     mock_log.assert_called_once()
     logged_args, logged_payload, kwargs = mock_log.call_args[0][0], mock_log.call_args[0][1], mock_log.call_args[1]
@@ -55,4 +55,5 @@ def test_rollout_pipeline_wandb_monitor_maybe_log():
     assert kwargs["step"] == 1
     assert logged_payload["queues/reward_samples"] == 1
     assert logged_payload["reward_computation/concurrency_utilization"] == 1.0
+    assert logged_payload["fully_async/backpressure_paused"] == 1
     assert "reward_computation/rm_latency_mean" not in logged_payload

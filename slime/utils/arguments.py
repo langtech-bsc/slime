@@ -327,6 +327,14 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--sglang-stream-output",
+                action="store_true",
+                help=(
+                    "The external SGLang servers use --stream-output, so streaming /generate "
+                    "chunks contain disjoint token/text segments instead of cumulative output."
+                ),
+            )
+            parser.add_argument(
                 "--fully-async-reward-concurrency",
                 type=int,
                 default=None,
@@ -373,6 +381,33 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--fully-async-backpressure-rate-multiplier",
+                type=float,
+                default=0.95,
+                help=(
+                    "For slime.rollout.fully_async_rollout only: admit generation at this fraction "
+                    "of the slower measured reward/trainer sample rate."
+                ),
+            )
+            parser.add_argument(
+                "--fully-async-backpressure-rate-window-seconds",
+                type=float,
+                default=300.0,
+                help=(
+                    "For slime.rollout.fully_async_rollout only: rolling sample-rate measurement "
+                    "window. Must be at least 30 seconds."
+                ),
+            )
+            parser.add_argument(
+                "--fully-async-backpressure-high-watermark-samples",
+                type=int,
+                default=None,
+                help=(
+                    "For slime.rollout.fully_async_rollout only: soft reward/training queue limit in "
+                    "samples. Defaults to max(global_batch_size, rollout_batch_size * n_samples_per_prompt)."
+                ),
+            )
+            parser.add_argument(
                 "--rollout-temperature",
                 type=float,
                 default=1.0,
@@ -383,6 +418,24 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
             parser.add_argument(
                 "--rollout-top-k", type=int, default=-1, help="the top-k for the inference engine during rollout."
+            )
+            parser.add_argument(
+                "--rollout-min-p",
+                type=float,
+                default=0.0,
+                help="the minimum probability for the inference engine during rollout.",
+            )
+            parser.add_argument(
+                "--rollout-presence-penalty",
+                type=float,
+                default=0.0,
+                help="the presence penalty for the inference engine during rollout.",
+            )
+            parser.add_argument(
+                "--rollout-repetition-penalty",
+                type=float,
+                default=1.0,
+                help="the repetition penalty for the inference engine during rollout.",
             )
             parser.add_argument(
                 "--rollout-max-context-len",
@@ -1706,7 +1759,16 @@ def parse_args(add_custom_arguments=None):
 
 
 def _apply_megatron_role_overrides(base_args, overrides, role):
-    role_args = copy.deepcopy(base_args)
+    # Runtime handles (for example the driver's offline W&B queue) are
+    # intentionally private and may not support deepcopy. Preserve them by
+    # reference while keeping normal argument values isolated per role.
+    private_args = {key: value for key, value in vars(base_args).items() if key.startswith("_")}
+    base_args_for_copy = copy.copy(base_args)
+    for key in private_args:
+        delattr(base_args_for_copy, key)
+    role_args = copy.deepcopy(base_args_for_copy)
+    for key, value in private_args.items():
+        setattr(role_args, key, value)
     ignored_keys = {"num_nodes", "num_gpus_per_node"}
 
     # Apply overrides from the YAML config.

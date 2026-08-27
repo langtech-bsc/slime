@@ -1,4 +1,5 @@
 import logging
+from queue import Empty
 
 import wandb
 
@@ -41,10 +42,33 @@ def finish_tracking(args):
         logging.getLogger(__name__).exception("Failed to finish wandb run")
 
 
+def drain_offline_wandb_queue(args) -> int:
+    """Forward queued worker metrics through the driver's offline W&B run."""
+    queue = getattr(args, "_wandb_metric_queue", None)
+    if queue is None or not args.use_wandb:
+        return 0
+
+    drained = 0
+    while True:
+        try:
+            metrics, _step_key = queue.get_nowait()
+        except Empty:
+            break
+        # Worker streams have independent train/rollout steps, while queue
+        # snapshots use wall-clock cadence. Use one monotonic W&B history
+        # step and let define_metric() map the custom step axes.
+        wandb.log(metrics)
+        drained += 1
+    return drained
+
+
 # TODO further refactor, e.g. put TensorBoard init to the "init" part
 def log(args, metrics, step_key: str | None = None, *, step: int | float | None = None):
     if args.use_wandb:
-        if step_key is not None and step_key in metrics:
+        queue = getattr(args, "_wandb_metric_queue", None)
+        if queue is not None:
+            queue.put((dict(metrics), step_key))
+        elif step_key is not None and step_key in metrics:
             wandb.log(metrics, step=int(metrics[step_key]))
         else:
             wandb.log(metrics)

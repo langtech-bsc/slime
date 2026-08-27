@@ -19,9 +19,10 @@ file only replaces the inner HTTP call.
 
 sglang's default streaming output is cumulative — server-side
 ``state.output_token_logprobs`` accumulates and every chunk references the
-full list-so-far (see ``tokenizer_manager.py``). If anyone ever flips
-``--incremental-streaming-output`` on the sglang server, the text/output_ids
-deltas will need different handling here.
+full list-so-far (see ``tokenizer_manager.py``). Production servers should use
+``--stream-output`` together with slime's ``--sglang-stream-output`` so each
+chunk is a disjoint segment. This avoids quadratic JSON traffic and client
+work for long generations.
 """
 
 import json
@@ -111,6 +112,7 @@ async def generate_streaming(args: Namespace, sample: Sample, sampling_params: d
     call_tokens: list[int] = []
     call_log_probs: list[float] = []
     call_text: str = ""
+    stream_output = bool(getattr(args, "sglang_stream_output", False))
 
     client = http_utils._http_client
     assert client is not None, "http client not initialized; call init_http_client first"
@@ -135,30 +137,70 @@ async def generate_streaming(args: Namespace, sample: Sample, sampling_params: d
                 meta = chunk.get("meta_info") or {}
                 last_meta_info = meta
 
-                call_text = chunk.get("text", call_text)
+                chunk_text = chunk.get("text", "")
                 if "output_token_logprobs" in meta:
-                    call_tokens = [item[1] for item in meta["output_token_logprobs"]]
-                    call_log_probs = [item[0] for item in meta["output_token_logprobs"]]
+                    cumulative_logprobs = meta["output_token_logprobs"]
+                else:
+                    cumulative_logprobs = []
 
-                # Surface partial state on the sample immediately. If the
-                # outer abort path cuts us, whatever we've written so far is
-                # what survives — no /abort_request round-trip needed.
-                sample.tokens = list(base_tokens)
-                sample.response = base_response
-                sample.response_length = base_response_length
-                sample.rollout_log_probs = None if base_log_probs is None else list(base_log_probs)
-                sample.rollout_top_p_token_ids = base_top_p_token_ids
-                sample.rollout_top_p_token_offsets = base_top_p_token_offsets
-                sample.loss_mask = None if base_loss_mask is None else list(base_loss_mask)
-                sample.append_response_tokens(
-                    args,
-                    tokens=call_tokens,
-                    log_probs=call_log_probs,
-                    trainable=True,
-                    meta_info=meta,
-                    text=call_text,
-                    update_terminal_info=bool(meta.get("finish_reason")),
-                )
+                if stream_output:
+                    # In SGLang 0.5.9, --stream-output makes output_ids
+                    # disjoint while text and output_token_logprobs remain
+                    # cumulative. Use the disjoint ids and the corresponding
+                    # logprob tail, then derive the text suffix.
+                    chunk_tokens = list(chunk.get("output_ids") or [])
+                    if not chunk_tokens and len(cumulative_logprobs) > len(call_tokens):
+                        chunk_tokens = [item[1] for item in cumulative_logprobs[len(call_tokens) :]]
+                    chunk_log_probs = [item[0] for item in cumulative_logprobs[-len(chunk_tokens) :]] if chunk_tokens else []
+
+                    if chunk_text.startswith(call_text):
+                        text_delta = chunk_text[len(call_text) :]
+                    else:
+                        # Defensive fallback for a tokenizer correction: keep
+                        # token metadata incremental and replace only text.
+                        text_delta = None
+
+                    sample.append_response_tokens(
+                        args,
+                        tokens=chunk_tokens,
+                        log_probs=chunk_log_probs,
+                        trainable=True,
+                        meta_info=meta,
+                        text=text_delta,
+                        update_terminal_info=bool(meta.get("finish_reason")),
+                    )
+                    if text_delta is None:
+                        sample.response = base_response + chunk_text
+                    call_tokens.extend(chunk_tokens)
+                    call_log_probs.extend(chunk_log_probs)
+                    call_text = chunk_text
+                else:
+                    # Compatibility path for servers using cumulative SSE
+                    # output. This necessarily recopies cumulative state and
+                    # should not be used for long production generations.
+                    call_tokens = [item[1] for item in cumulative_logprobs]
+                    call_log_probs = [item[0] for item in cumulative_logprobs]
+                    call_text = chunk_text
+
+                    # Surface partial state on the sample immediately. If the
+                    # outer abort path cuts us, whatever we've written so far
+                    # is what survives — no /abort_request round-trip needed.
+                    sample.tokens = list(base_tokens)
+                    sample.response = base_response
+                    sample.response_length = base_response_length
+                    sample.rollout_log_probs = None if base_log_probs is None else list(base_log_probs)
+                    sample.rollout_top_p_token_ids = base_top_p_token_ids
+                    sample.rollout_top_p_token_offsets = base_top_p_token_offsets
+                    sample.loss_mask = None if base_loss_mask is None else list(base_loss_mask)
+                    sample.append_response_tokens(
+                        args,
+                        tokens=call_tokens,
+                        log_probs=call_log_probs,
+                        trainable=True,
+                        meta_info=meta,
+                        text=call_text,
+                        update_terminal_info=bool(meta.get("finish_reason")),
+                    )
 
                 if getattr(args, "rollout_degeneration_detection_enable", False):
                     signal = detect_degenerate_response(sample.response)

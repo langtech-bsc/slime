@@ -99,7 +99,7 @@ def _compute_config_for_logging(args):
 
 
 def _args_to_config_dict(args):
-    return deepcopy(args.__dict__)
+    return deepcopy({key: value for key, value in args.__dict__.items() if not key.startswith("_")})
 
 
 def _prefix_config_keys(config, prefix):
@@ -126,6 +126,12 @@ def _compute_secondary_config_for_logging(args, role=None):
 def init_wandb_secondary(args, role=None):
     wandb_run_id = getattr(args, "wandb_run_id", None)
     if wandb_run_id is None:
+        return
+
+    # Offline W&B has one local history per process. When the driver supplies
+    # a queue, workers forward metrics to the driver's single offline run
+    # instead of creating same-ID histories that cannot be merged by sync.
+    if _is_offline_mode(args) and getattr(args, "_wandb_metric_queue", None) is not None:
         return
 
     # Set W&B mode if specified (same as primary)

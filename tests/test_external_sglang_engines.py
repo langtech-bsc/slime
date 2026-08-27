@@ -8,7 +8,11 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from slime.backends.sglang_utils.external import apply_external_engine_info_to_args, discover_external_engines
+from slime.backends.sglang_utils.external import (
+    apply_external_engine_info_to_args,
+    discover_external_engines,
+    discover_external_engines_with_retry,
+)
 from slime.utils.http_utils import get_rollout_num_engines
 
 NUM_GPUS = 0
@@ -130,6 +134,70 @@ def test_apply_external_engine_info_preserves_router_pd_flag(monkeypatch):
     assert args.router_pd_disaggregation is True
     assert args.rollout_num_gpus == 2
     assert args.rollout_num_engines == 1
+
+
+def test_external_engine_discovery_retries_transient_startup(monkeypatch):
+    attempts = 0
+
+    def fake_discover(addrs, timeout):
+        nonlocal attempts
+        attempts += 1
+        if attempts < 3:
+            raise RuntimeError("connection refused")
+        return [
+            type(
+                "Info",
+                (),
+                {
+                    "url": "http://host1:10090",
+                    "host": "host1",
+                    "port": 10090,
+                    "worker_type": "regular",
+                    "num_gpus": 2,
+                    "disaggregation_bootstrap_port": None,
+                    "server_info": {"tp_size": 2},
+                    "to_dict": lambda self: {
+                        "url": self.url,
+                        "host": self.host,
+                        "port": self.port,
+                        "worker_type": self.worker_type,
+                        "num_gpus": self.num_gpus,
+                        "disaggregation_bootstrap_port": self.disaggregation_bootstrap_port,
+                        "server_info": self.server_info,
+                    },
+                },
+            )()
+        ]
+
+    monkeypatch.setattr(
+        "slime.backends.sglang_utils.external.discover_external_engines", fake_discover
+    )
+    monkeypatch.setattr("slime.backends.sglang_utils.external.time.sleep", lambda _: None)
+
+    infos = discover_external_engines_with_retry(
+        ["host1:10090"], overall_timeout=1, retry_interval=0.001
+    )
+
+    assert attempts == 3
+    assert infos[0].num_gpus == 2
+
+
+def test_apply_external_engine_info_can_defer_discovery(monkeypatch):
+    monkeypatch.setenv("SLIME_DEFER_EXTERNAL_ENGINE_DISCOVERY", "1")
+    monkeypatch.setenv("ROLLOUT_EXTERNAL_ENGINE_COUNT", "6")
+    monkeypatch.setenv("ROLLOUT_EXTERNAL_ENGINE_GPUS_PER_ENGINE", "2")
+    args = Namespace(
+        rollout_external_engine_addrs=[f"host{i}:10090" for i in range(6)]
+    )
+
+    apply_external_engine_info_to_args(args)
+
+    assert len(args.rollout_external_engine_infos) == 6
+    assert args.rollout_num_engines == 6
+    assert args.rollout_num_gpus == 12
+    assert {info["worker_type"] for info in args.rollout_external_engine_infos} == {"regular"}
+    assert {info["num_gpus"] for info in args.rollout_external_engine_infos} == {2}
+    assert all(info["server_info"]["tp_size"] == 2 for info in args.rollout_external_engine_infos)
 
 
 def test_apply_external_engine_info_requires_addrs():

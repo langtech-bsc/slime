@@ -8,7 +8,12 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-from slime.ray.placement_group import _create_placement_group, _get_placement_group_layout, create_placement_groups
+from slime.ray.placement_group import (
+    _create_placement_group,
+    _get_placement_group_layout,
+    create_placement_groups,
+    resolve_num_rollout,
+)
 
 NUM_GPUS = 0
 
@@ -70,6 +75,62 @@ def test_async_opd_reserves_disjoint_teacher_bundles(monkeypatch):
 
     assert groups["rollout"][1][:12] == list(range(4, 16))
     assert groups["opd_teacher"][1] == list(range(16, 20))
+
+
+def test_resolve_num_rollout_from_epoch_and_dataset(monkeypatch):
+    class FakeDataSource:
+        def __init__(self, args):
+            self.args = args
+
+        def __len__(self):
+            return 10
+
+    monkeypatch.setattr("slime.utils.misc.load_function", lambda path: FakeDataSource)
+
+    args = Namespace(
+        num_rollout=None,
+        num_epoch=2,
+        rollout_batch_size=5,
+        data_source_path="fake.DataSource",
+        rollout_global_dataset=True,
+    )
+
+    assert resolve_num_rollout(args) == 2
+    assert args.num_rollout == 4
+
+
+def test_resolve_num_rollout_is_noop_when_already_set(monkeypatch):
+    def fail_load(_path):
+        raise AssertionError("data source should not be loaded when num_rollout is set")
+
+    monkeypatch.setattr("slime.utils.misc.load_function", fail_load)
+
+    args = Namespace(num_rollout=8, num_epoch=1, data_source_path="fake.DataSource")
+    assert resolve_num_rollout(args) is None
+    assert args.num_rollout == 8
+
+
+def test_resolve_num_rollout_is_noop_without_epoch(monkeypatch):
+    def fail_load(_path):
+        raise AssertionError("data source should not be loaded when num_epoch is unset")
+
+    monkeypatch.setattr("slime.utils.misc.load_function", fail_load)
+
+    args = Namespace(num_rollout=None, num_epoch=None, data_source_path="fake.DataSource")
+    assert resolve_num_rollout(args) is None
+    assert args.num_rollout is None
+
+
+def test_resolve_num_rollout_requires_global_dataset():
+    args = Namespace(
+        num_rollout=None,
+        num_epoch=1,
+        rollout_batch_size=4,
+        data_source_path="fake.DataSource",
+        rollout_global_dataset=False,
+    )
+    with pytest.raises(AssertionError, match="rollout_global_dataset"):
+        resolve_num_rollout(args)
 
 
 if __name__ == "__main__":

@@ -56,7 +56,7 @@ def _qwen3_5_config_from_checkpoint(hf_model_path: str):
 
     with open(os.path.join(hf_model_path, "config.json"), encoding="utf-8") as config_file:
         config = as_namespace(json.load(config_file))
-    if getattr(config, "model_type", None) != "qwen3_5":
+    if not str(getattr(config, "model_type", "")).startswith("qwen3_5"):
         raise ValueError(f"Expected a qwen3_5 checkpoint at {hf_model_path}")
     return config
 
@@ -67,7 +67,7 @@ def _load_bridge(hf_model_path: str):
     except ValueError as exc:
         # Transformers raises this exact architecture error before mbridge gets
         # a chance to select slime_plugins.mbridge.Qwen3_5Bridge.
-        if "model type `qwen3_5`" not in str(exc):
+        if "model type `qwen3_5" not in str(exc):
             raise
         bridge = AutoBridge.from_config(_qwen3_5_config_from_checkpoint(hf_model_path))
         # SafeTensorIO independently loads AutoConfig only to decide whether a

@@ -764,6 +764,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "the input should be the same structure as an openai message, e.g. [{'role': 'user', 'content': 'blabla'}]. "
                 ),
             )
+            parser.add_argument(
+                "--prompt-data-mixture",
+                type=json.loads,
+                default=None,
+                help=(
+                    "JSON object describing weighted prompt-data sources. Each source has a path, "
+                    "a positive weight, and optionally a name; total_samples defaults to the "
+                    "sum of usable source rows."
+                ),
+            )
             parser.add_argument("--apply-chat-template", action="store_true", default=False)
             # Temporarily be JSON-serialized str, will be a real dict after using Omegaconf
             parser.add_argument("--apply-chat-template-kwargs", type=json.loads, default="{}")

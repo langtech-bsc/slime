@@ -4,6 +4,9 @@ import logging
 import os
 import random
 import re
+from collections.abc import Iterator, Mapping
+from copy import deepcopy
+from pathlib import Path
 
 import numpy as np
 import ray
@@ -21,51 +24,113 @@ __all__ = ["Dataset"]
 
 logger = logging.getLogger(__name__)
 
+_MISSING = object()
 
-def read_file(path):
+
+def _get_data_field(data: Mapping, key: str | None):
+    """Read a flat or dotted field from one dataset row.
+
+    Flat keys retain precedence so existing datasets containing literal dots in
+    a field name continue to work. Dotted paths are used by the new RL data
+    format, for example ``specific_metadata.label``.
+    """
+
+    if key is None:
+        return _MISSING
+    if key in data:
+        return data[key]
+
+    value = data
+    for part in str(key).split("."):
+        if not isinstance(value, Mapping) or part not in value:
+            return _MISSING
+        value = value[part]
+    return value
+
+
+def _iter_jsonl_files(path: str) -> list[Path]:
+    """Return JSONL files for a file or recursively configured directory."""
+
+    candidate = Path(path)
+    if candidate.is_dir():
+        files = sorted(
+            (item for item in candidate.rglob("*.jsonl") if item.is_file()),
+            key=lambda item: item.as_posix(),
+        )
+        if not files:
+            raise ValueError(f"Prompt dataset directory '{path}' contains no JSONL files.")
+        return files
+    return [candidate]
+
+
+def _iter_rows_from_file(path: Path) -> Iterator[tuple[dict, str]]:
+    """Read one supported data file and include a source location per row."""
+
+    path_text = os.fspath(path)
+    if path.suffix.lower() == ".jsonl":
+        with path.open(encoding="utf-8") as handle:
+            for line_number, line in enumerate(handle, 1):
+                if not line.strip():
+                    continue
+                location = f"{path_text}:{line_number}"
+                try:
+                    data = json.loads(line)
+                except json.JSONDecodeError as error:
+                    logger.warning("Skipping invalid JSON row at %s: %s", location, error)
+                    continue
+                if not isinstance(data, dict):
+                    logger.warning(
+                        "Skipping row at %s: expected a JSON object, got %s",
+                        location,
+                        type(data).__name__,
+                    )
+                    continue
+                yield data, location
+        return
+
+    if path.suffix.lower() == ".parquet":
+        if pq is None:
+            raise ImportError("pyarrow is required for parquet support")
+        parquet_file = pq.ParquetFile(path)
+        row_number = 0
+        for batch in parquet_file.iter_batches():
+            for data in batch.to_pylist():
+                location = f"{path_text}:row={row_number}"
+                row_number += 1
+                if not isinstance(data, dict):
+                    logger.warning(
+                        "Skipping row at %s: expected a mapping, got %s",
+                        location,
+                        type(data).__name__,
+                    )
+                    continue
+                yield data, location
+        return
+
+    raise ValueError(f"Unsupported file format: {path}. Supported formats are .jsonl and .parquet.")
+
+
+def _iter_rows_with_source(path: str) -> Iterator[tuple[dict, str]]:
     path, row_slice = _parse_generalized_path(path)
-    reader = None
 
     if not os.path.exists(path):
         raise FileNotFoundError(f"Prompt dataset path '{path}' does not exist.")
 
-    if path.endswith(".jsonl"):
-
-        def jsonl_reader(p):
-            with open(p, encoding="utf-8") as f:
-                for line_num, line in enumerate(f):
-                    line = line.strip()
-                    if not line:
-                        continue
-                    try:
-                        yield json.loads(line)
-                    except json.JSONDecodeError as e:
-                        print(f"JSON decode error at line {line_num}: {e}")
-                        continue
-
-        reader = jsonl_reader(path)
-
-    elif path.endswith(".parquet"):
-        if pq is None:
-            raise ImportError("pyarrow is required for parquet support")
-
-        def parquet_reader(p):
-            pf = pq.ParquetFile(p)
-
-            for batch in pf.iter_batches():
-                yield from batch.to_pylist()
-
-        reader = parquet_reader(path)
-
-    else:
-        raise ValueError(f"Unsupported file format: {path}. Supported formats are .jsonl and .parquet.")
-
+    files = _iter_jsonl_files(path) if os.path.isdir(path) else [Path(path)]
+    reader: Iterator[tuple[dict, str]] = (
+        row for file_path in files for row in _iter_rows_from_file(file_path)
+    )
     if row_slice is not None:
-
         logger.info("read_file path=%s applying slice row_slice=%s", path, row_slice)
         reader = itertools.islice(reader, row_slice.start, row_slice.stop, row_slice.step)
-
     yield from reader
+
+
+def read_file(path):
+    """Yield rows from one file or all sorted JSONL shards in a directory."""
+
+    for data, _location in _iter_rows_with_source(os.fspath(path)):
+        yield data
 
 
 def _parse_generalized_path(s: str):
@@ -128,7 +193,9 @@ def filter_long_prompt(origin_samples: list[Sample], tokenizer, processor, max_l
 
 
 def _build_messages(data: dict, prompt_key: str, as_conversation: bool, multimodal_keys: dict = None):
-    prompt = data.get(prompt_key)
+    prompt = _get_data_field(data, prompt_key)
+    if prompt is _MISSING:
+        prompt = None
 
     if isinstance(prompt, str):
         # If prompt is a string and we don't apply chat template, return the prompt as is.
@@ -143,7 +210,9 @@ def _build_messages(data: dict, prompt_key: str, as_conversation: bool, multimod
         for type_name, data_key in multimodal_keys.items():
             mt = MultimodalTypes.get(type_name)
             if mt:
-                multimodal_data = data.get(data_key)
+                multimodal_data = _get_data_field(data, data_key)
+                if multimodal_data is _MISSING:
+                    multimodal_data = None
                 if multimodal_data is not None:
                     multimodals[mt.placeholder] = (mt, list(multimodal_data))
 
@@ -199,6 +268,314 @@ def _build_messages(data: dict, prompt_key: str, as_conversation: bool, multimod
     return prompt
 
 
+_LABEL_REQUIRED_REWARD_FAMILIES = frozenset({"rar", "dapo", "math", "code", "code_rlvr"})
+
+
+def _normalize_reward_family(value) -> str:
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    if isinstance(value, list) and len(value) == 1:
+        family = value[0]
+        if isinstance(family, str) and family.strip():
+            return family.strip()
+    raise ValueError("specific_metadata.reward_family must be one non-empty string")
+
+
+def _usable_label(value) -> bool:
+    if value is _MISSING or value is None:
+        return False
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, (dict, list, tuple, set)):
+        return bool(value)
+    return True
+
+
+def _normalize_new_row(data: dict) -> dict:
+    """Convert the post-training source schema into Slime's canonical row."""
+
+    messages = data.get("messages")
+    specific_metadata = data.get("specific_metadata")
+    if not isinstance(messages, list) or not messages:
+        raise ValueError("messages must be a non-empty list")
+    if not isinstance(specific_metadata, dict):
+        raise ValueError("specific_metadata must be an object")
+
+    normalized_messages = []
+    for message_index, message in enumerate(messages):
+        if not isinstance(message, dict):
+            raise ValueError(f"messages[{message_index}] must be an object")
+        role = message.get("role")
+        if not isinstance(role, str) or not role.strip():
+            raise ValueError(f"messages[{message_index}].role must be a non-empty string")
+        if "content" not in message:
+            raise ValueError(f"messages[{message_index}].content is missing")
+        content = message["content"]
+        if not isinstance(content, (str, list, dict)):
+            raise ValueError(
+                f"messages[{message_index}].content must be a string, list, or object"
+            )
+        normalized_messages.append(
+            {
+                "role": role.strip(),
+                "content": deepcopy(content),
+            }
+        )
+
+    if normalized_messages[-1]["role"] != "user":
+        raise ValueError("messages must end with a user turn for generation")
+
+    reward_family = _normalize_reward_family(specific_metadata.get("reward_family"))
+    raw_label = specific_metadata.get("label", _MISSING)
+    reference_answer = specific_metadata.get("reference_answer", _MISSING)
+    if reward_family == "rar":
+        if _usable_label(reference_answer):
+            label = reference_answer
+        elif isinstance(raw_label, str) and _usable_label(raw_label):
+            label = raw_label
+        else:
+            label = None
+    elif _usable_label(raw_label):
+        label = raw_label
+    else:
+        label = None
+
+    if reward_family in _LABEL_REQUIRED_REWARD_FAMILIES and not _usable_label(label):
+        raise ValueError(f"label is required for reward_family={reward_family!r}")
+
+    metadata = dict(specific_metadata)
+    metadata["reward_family"] = reward_family
+    for key in ("id", "source_id", "dataset_name", "task", "lang", "license"):
+        if key in data:
+            metadata.setdefault(key, data[key])
+    source_metadata = data.get("source_metadata", _MISSING)
+    if source_metadata is not _MISSING:
+        if not isinstance(source_metadata, dict):
+            raise ValueError("source_metadata must be an object when present")
+        metadata.setdefault("provenance", {"source_metadata": deepcopy(source_metadata)})
+
+    normalized = dict(data)
+    normalized.update(
+        {
+            "prompt": normalized_messages,
+            "label": label,
+            "metadata": metadata,
+        }
+    )
+    return normalized
+
+
+def _is_new_format_row(data: dict) -> bool:
+    return "messages" in data or "specific_metadata" in data
+
+
+_MIXTURE_KEYS = frozenset({"seed", "total_samples", "sources"})
+_MIXTURE_SOURCE_KEYS = frozenset({"name", "path", "weight"})
+
+
+def _normalize_mixture_config(mixture, base_path, default_seed: int) -> dict:
+    """Validate and resolve a YAML-configured prompt-data mixture."""
+
+    if not isinstance(mixture, Mapping):
+        raise ValueError("prompt data mixture must be an object")
+    unknown = sorted(set(mixture) - _MIXTURE_KEYS)
+    if unknown:
+        raise ValueError(f"prompt data mixture has unknown key(s): {', '.join(unknown)}")
+
+    sources = mixture.get("sources")
+    if not isinstance(sources, list) or not sources:
+        raise ValueError("prompt data mixture.sources must be a non-empty list")
+
+    base = Path(base_path)
+    base_dir = base if base.is_dir() else base.parent
+    normalized_sources = []
+    names = set()
+    for index, source in enumerate(sources):
+        if not isinstance(source, Mapping):
+            raise ValueError(f"prompt data mixture.sources[{index}] must be an object")
+        unknown = sorted(set(source) - _MIXTURE_SOURCE_KEYS)
+        if unknown:
+            raise ValueError(
+                f"prompt data mixture.sources[{index}] has unknown key(s): {', '.join(unknown)}"
+            )
+        source_path = source.get("path")
+        if not isinstance(source_path, str) or not source_path.strip():
+            raise ValueError(f"prompt data mixture.sources[{index}].path must be a non-empty string")
+        weight = source.get("weight")
+        if isinstance(weight, bool) or not isinstance(weight, (int, float)) or weight <= 0:
+            raise ValueError(
+                f"prompt data mixture.sources[{index}].weight must be a positive number"
+            )
+        name = source.get("name")
+        if name is not None:
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError(
+                    f"prompt data mixture.sources[{index}].name must be a non-empty string"
+                )
+            name = name.strip()
+            if name in names:
+                raise ValueError(f"prompt data mixture source name is duplicated: {name!r}")
+            names.add(name)
+
+        raw_path, row_slice = _parse_generalized_path(source_path.strip())
+        if not os.path.isabs(raw_path):
+            raw_path = os.fspath(base_dir / raw_path)
+        if row_slice is not None:
+            start = "" if row_slice.start is None else row_slice.start
+            end = "" if row_slice.stop is None else row_slice.stop
+            resolved_path = f"{raw_path}@[{start}:{end}]"
+        else:
+            resolved_path = raw_path
+        normalized_source = {"path": resolved_path, "weight": float(weight)}
+        if name is not None:
+            normalized_source["name"] = name
+        normalized_sources.append(normalized_source)
+
+    seed = mixture.get("seed", default_seed)
+    if isinstance(seed, bool) or not isinstance(seed, int):
+        raise ValueError("prompt data mixture.seed must be an integer")
+    total_samples = mixture.get("total_samples")
+    if total_samples is not None and (
+        isinstance(total_samples, bool) or not isinstance(total_samples, int) or total_samples <= 0
+    ):
+        raise ValueError("prompt data mixture.total_samples must be a positive integer")
+
+    return {
+        "seed": seed,
+        "total_samples": total_samples,
+        "sources": normalized_sources,
+    }
+
+
+def _usable_mixture_row(data: dict) -> bool:
+    """Return whether a row can enter a mixture without normalizing it twice later."""
+
+    if not _is_new_format_row(data):
+        return True
+    try:
+        _normalize_new_row(data)
+    except ValueError:
+        return False
+    return True
+
+
+def _count_mixture_rows(path: str) -> int:
+    """Count usable rows in one mixture source without retaining large records."""
+
+    return sum(
+        1 for data, _location in _iter_rows_with_source(path) if _usable_mixture_row(data)
+    )
+
+
+def _allocate_mixture_counts(total_samples: int, weights: list[float]) -> list[int]:
+    """Allocate an exact total using the largest-remainder method."""
+
+    weight_total = sum(weights)
+    exact = [total_samples * weight / weight_total for weight in weights]
+    counts = [int(value) for value in exact]
+    remainder = total_samples - sum(counts)
+    order = sorted(
+        range(len(weights)),
+        key=lambda index: (-(exact[index] - counts[index]), index),
+    )
+    for index in order[:remainder]:
+        counts[index] += 1
+    return counts
+
+
+def _largest_without_replacement_mix(
+    available_counts: list[int], weights: list[float]
+) -> tuple[int, list[int]]:
+    """Find the largest weighted mixture that fits every source once."""
+
+    weight_total = sum(weights)
+    upper_bound = min(
+        int(available / (weight / weight_total))
+        for available, weight in zip(available_counts, weights, strict=True)
+    )
+    for total_samples in range(upper_bound, 0, -1):
+        requested_counts = _allocate_mixture_counts(total_samples, weights)
+        if all(
+            requested <= available
+            for requested, available in zip(requested_counts, available_counts, strict=True)
+        ):
+            return total_samples, requested_counts
+    raise ValueError("prompt data mixture cannot allocate a positive no-replacement sample")
+
+
+def _iter_selected_mixture_rows(path: str, available: int, requested: int, seed: int):
+    """Yield a deterministic sample from one source without replacement."""
+
+    if requested <= 0:
+        return
+    if requested > available:
+        raise ValueError(
+            f"prompt data mixture requests {requested} rows from a source with only "
+            f"{available} usable rows"
+        )
+    order = list(range(available))
+    random.Random(seed).shuffle(order)
+    selected = set(order[:requested])
+    row_index = 0
+    for data, location in _iter_rows_with_source(path):
+        if not _usable_mixture_row(data):
+            continue
+        if row_index in selected:
+            yield data, location
+        row_index += 1
+
+
+def _iter_mixture_rows(path: str, mixture, default_seed: int):
+    """Yield rows according to exact source weights, without retaining raw rows."""
+
+    normalized = _normalize_mixture_config(mixture, path, default_seed)
+    sources = normalized["sources"]
+    available_counts = [_count_mixture_rows(source["path"]) for source in sources]
+    empty = [
+        source["name"] if "name" in source else source["path"]
+        for source, count in zip(sources, available_counts, strict=True)
+        if count == 0
+    ]
+    if empty:
+        raise ValueError(f"prompt data mixture source(s) contain no usable rows: {', '.join(empty)}")
+
+    total_samples = normalized["total_samples"]
+    if total_samples is None:
+        total_samples, requested_counts = _largest_without_replacement_mix(
+            available_counts, [source["weight"] for source in sources]
+        )
+    else:
+        requested_counts = _allocate_mixture_counts(
+            total_samples, [source["weight"] for source in sources]
+        )
+        if any(
+            requested > available
+            for requested, available in zip(requested_counts, available_counts, strict=True)
+        ):
+            details = ", ".join(
+                f"{source.get('name', source['path'])}: requested {requested}, available {available}"
+                for source, requested, available in zip(
+                    sources, requested_counts, available_counts, strict=True
+                )
+            )
+            raise ValueError(
+                "prompt data mixture would oversample a source; reduce total_samples "
+                f"or adjust weights ({details})"
+            )
+    logger.info(
+        "Prompt data mixture sources=%s available=%s requested=%s",
+        [source.get("name", source["path"]) for source in sources],
+        available_counts,
+        requested_counts,
+    )
+    for index, (source, available, requested) in enumerate(
+        zip(sources, available_counts, requested_counts, strict=True)
+    ):
+        yield from _iter_selected_mixture_rows(
+            source["path"], available, requested, normalized["seed"] + index
+        )
+
+
 class Dataset:
     def __init__(
         self,
@@ -215,17 +592,46 @@ class Dataset:
         seed=42,
         apply_chat_template=False,
         apply_chat_template_kwargs=None,
+        mixture=None,
     ):
         origin_samples = []
-        for data in read_file(path):
+        skipped_rows = 0
+        row_iterator = (
+            _iter_rows_with_source(os.fspath(path))
+            if mixture is None
+            else _iter_mixture_rows(os.fspath(path), mixture, seed)
+        )
+        for data, location in row_iterator:
+            if _is_new_format_row(data):
+                try:
+                    data = _normalize_new_row(data)
+                except ValueError as error:
+                    skipped_rows += 1
+                    logger.warning("Skipping invalid dataset row at %s: %s", location, error)
+                    continue
+                row_prompt_key = "prompt"
+                row_label_key = "label"
+                row_metadata_key = "metadata"
+            else:
+                row_prompt_key = prompt_key
+                row_label_key = label_key
+                row_metadata_key = metadata_key
+
             # Both chat templates and multimodal inputs require conversation format (list of message dicts)
             as_conversation = apply_chat_template or (multimodal_keys is not None)
-            prompt = _build_messages(data, prompt_key, as_conversation, multimodal_keys)
+            prompt = _build_messages(data, row_prompt_key, as_conversation, multimodal_keys)
 
-            metadata = data.get(metadata_key) or {}
+            raw_metadata = _get_data_field(data, row_metadata_key)
+            if raw_metadata is _MISSING or raw_metadata is None:
+                metadata = {}
+            elif not isinstance(raw_metadata, dict):
+                raise ValueError(f"metadata field {row_metadata_key!r} must be an object")
+            else:
+                metadata = dict(raw_metadata)
             tools = None
-            if tool_key is not None and tool_key in data:
-                tools = data[tool_key]
+            tool_value = _get_data_field(data, tool_key)
+            if tool_value is not _MISSING:
+                tools = tool_value
                 if isinstance(tools, str):
                     tools = json.loads(tools)
                 elif isinstance(tools, np.ndarray):
@@ -257,10 +663,33 @@ class Dataset:
             origin_samples.append(
                 Sample(
                     prompt=output_prompt,
-                    label=data[label_key] if label_key is not None else None,
+                    label=(
+                        None
+                        if row_label_key is None
+                        else (
+                            None
+                            if (label_value := _get_data_field(data, row_label_key)) is _MISSING
+                            else label_value
+                        )
+                    ),
                     metadata=metadata,
                     multimodal_inputs=multimodal_inputs,
                 )
+            )
+
+        if not origin_samples:
+            raise ValueError(f"No usable prompt rows loaded from '{path}'.")
+        if skipped_rows:
+            logger.warning(
+                "Loaded %s prompt rows from %s; skipped %s invalid new-format rows.",
+                len(origin_samples),
+                path,
+                skipped_rows,
+            )
+
+        if mixture is not None:
+            random.Random(_normalize_mixture_config(mixture, os.fspath(path), seed)["seed"]).shuffle(
+                origin_samples
             )
 
         if max_length is not None:

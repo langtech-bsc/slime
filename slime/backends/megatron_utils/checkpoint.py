@@ -5,10 +5,15 @@ from pathlib import Path
 
 # TODO: may need to copy those 2 functions and do refactoring.
 from megatron.training.checkpointing import load_checkpoint as _load_checkpoint_megatron
-from megatron.training.checkpointing import save_checkpoint
+from megatron.training.checkpointing import save_checkpoint as _save_checkpoint_megatron
 from megatron.training.global_vars import get_args
 
 from slime.utils import megatron_bridge_utils
+from slime.utils.checkpoint_runtime_args import (
+    restore_ray_runtime_args,
+    snapshot_ray_runtime_args,
+    strip_ray_runtime_args,
+)
 
 try:
     # Here we patch out the `validate_non_overlapping_shards_metadata` in both functions
@@ -91,7 +96,18 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["save_checkpoint"]
+__all__ = ["load_checkpoint", "save_checkpoint"]
+
+
+def save_checkpoint(*args, preprocess_common_state_dict_fn=None, **kwargs):
+    def _preprocess(state_dict):
+        if preprocess_common_state_dict_fn is not None:
+            state_dict = preprocess_common_state_dict_fn(state_dict)
+        return strip_ray_runtime_args(state_dict)
+
+    return _save_checkpoint_megatron(
+        *args, preprocess_common_state_dict_fn=_preprocess, **kwargs
+    )
 
 
 def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_context, skip_load_to_model_and_opt):
@@ -104,13 +120,16 @@ def load_checkpoint(ddp_model, optimizer, opt_param_scheduler, checkpointing_con
     ), f"{args.load=} does not exist or is an empty directory. Did you specify the wrong folder?"
 
     if _is_megatron_checkpoint(load_path):
-        return _load_checkpoint_megatron(
+        live_ray_args = snapshot_ray_runtime_args(args)
+        result = _load_checkpoint_megatron(
             ddp_model=ddp_model,
             optimizer=optimizer,
             opt_param_scheduler=opt_param_scheduler,
             checkpointing_context=checkpointing_context,
             skip_load_to_model_and_opt=skip_load_to_model_and_opt,
         )
+        restore_ray_runtime_args(args, live_ray_args)
+        return result
     else:
         return _load_checkpoint_hf(
             ddp_model=ddp_model,

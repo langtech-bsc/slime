@@ -399,12 +399,21 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--fully-async-backpressure-reward-soft-watermark-samples",
+                type=int,
+                default=None,
+                help=(
+                    "For fully async rollout: reward backlog below this sample count is never rate-limited. "
+                    "Between this watermark and the hard watermark, PID backpressure is applied."
+                ),
+            )
+            parser.add_argument(
                 "--fully-async-backpressure-high-watermark-samples",
                 type=int,
                 default=None,
                 help=(
-                    "For slime.rollout.fully_async_rollout only: soft reward/training queue limit in "
-                    "samples. Defaults to max(global_batch_size, rollout_batch_size * n_samples_per_prompt)."
+                    "For slime.rollout.fully_async_rollout only: hard reward backlog stop and training queue "
+                    "limit in samples. Defaults to max(global_batch_size, rollout_batch_size * n_samples_per_prompt)."
                 ),
             )
             parser.add_argument(

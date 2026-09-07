@@ -104,6 +104,11 @@ def _get_global_worker(args, data_buffer) -> AsyncRolloutWorker:
                 getattr(args, "global_batch_size", 0) or 0,
                 args.rollout_batch_size * args.n_samples_per_prompt,
             )
+            reward_soft_watermark_samples = getattr(
+                args,
+                "fully_async_backpressure_reward_soft_watermark_samples",
+                None,
+            )
             if (
                 generation_concurrency < 1
                 or reward_concurrency < 1
@@ -136,6 +141,7 @@ def _get_global_worker(args, data_buffer) -> AsyncRolloutWorker:
                 backpressure_rate_multiplier=rate_multiplier,
                 backpressure_rate_window_seconds=rate_window_seconds,
                 backpressure_high_watermark_samples=high_watermark_samples,
+                backpressure_reward_soft_watermark_samples=reward_soft_watermark_samples,
                 trainer_perf_queue=getattr(args, "_fully_async_trainer_perf_queue", None),
             )
             _global_worker.start()
@@ -194,6 +200,7 @@ class AsyncRolloutWorker:
         backpressure_rate_multiplier: float = DEFAULT_RATE_MULTIPLIER,
         backpressure_rate_window_seconds: float = DEFAULT_RATE_WINDOW_SECONDS,
         backpressure_high_watermark_samples: int | None = None,
+        backpressure_reward_soft_watermark_samples: int | None = None,
         trainer_perf_queue=None,
     ):
         self.args = args
@@ -216,6 +223,8 @@ class AsyncRolloutWorker:
             rate_multiplier=backpressure_rate_multiplier,
             rate_window_seconds=backpressure_rate_window_seconds,
             high_watermark_samples=high_watermark_samples,
+            reward_low_watermark_samples=backpressure_reward_soft_watermark_samples,
+            reward_hard_watermark_samples=high_watermark_samples,
         )
         self.trainer_perf_queue = trainer_perf_queue
         self.worker_thread: threading.Thread | None = None

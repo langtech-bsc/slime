@@ -10,9 +10,9 @@ from megatron.training.global_vars import get_args
 
 from slime.utils import megatron_bridge_utils
 from slime.utils.checkpoint_runtime_args import (
+    prepare_common_state_dict_for_save,
     restore_ray_runtime_args,
     snapshot_ray_runtime_args,
-    strip_ray_runtime_args,
 )
 
 try:
@@ -101,9 +101,10 @@ __all__ = ["load_checkpoint", "save_checkpoint"]
 
 def save_checkpoint(*args, preprocess_common_state_dict_fn=None, **kwargs):
     def _preprocess(state_dict):
-        if preprocess_common_state_dict_fn is not None:
-            state_dict = preprocess_common_state_dict_fn(state_dict)
-        return strip_ray_runtime_args(state_dict)
+        return prepare_common_state_dict_for_save(
+            state_dict,
+            preprocess_common_state_dict_fn=preprocess_common_state_dict_fn,
+        )
 
     return _save_checkpoint_megatron(
         *args, preprocess_common_state_dict_fn=_preprocess, **kwargs

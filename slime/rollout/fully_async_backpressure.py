@@ -13,7 +13,7 @@ WARNING_INTERVAL_SECONDS = 30.0
 
 
 class AdaptiveBackpressureController:
-    """Limit new generation using downstream sample rates and queue hysteresis."""
+    """Limit generation with reward-queue watermarks and a PID rate controller."""
 
     def __init__(
         self,
@@ -22,6 +22,11 @@ class AdaptiveBackpressureController:
         rate_window_seconds: float = DEFAULT_RATE_WINDOW_SECONDS,
         high_watermark_samples: int,
         low_watermark_fraction: float = 0.5,
+        reward_low_watermark_samples: int | None = None,
+        reward_hard_watermark_samples: int | None = None,
+        pid_kp: float = 1.0,
+        pid_ki: float = 0.10,
+        pid_kd: float = 0.05,
         clock=time.monotonic,
     ) -> None:
         if not math.isfinite(rate_multiplier) or not 0 < rate_multiplier <= 1:
@@ -40,6 +45,23 @@ class AdaptiveBackpressureController:
         self.rate_window_seconds = float(rate_window_seconds)
         self.high_watermark_samples = int(high_watermark_samples)
         self.low_watermark_samples = max(1, int(math.floor(high_watermark_samples * low_watermark_fraction)))
+        self.reward_low_watermark_samples = (
+            self.low_watermark_samples
+            if reward_low_watermark_samples is None
+            else int(reward_low_watermark_samples)
+        )
+        self.reward_hard_watermark_samples = (
+            self.high_watermark_samples
+            if reward_hard_watermark_samples is None
+            else int(reward_hard_watermark_samples)
+        )
+        if not 0 < self.reward_low_watermark_samples < self.reward_hard_watermark_samples:
+            raise ValueError("reward low watermark must be positive and below the hard watermark")
+        self.pid_kp = float(pid_kp)
+        self.pid_ki = float(pid_ki)
+        self.pid_kd = float(pid_kd)
+        if any(not math.isfinite(value) or value < 0 for value in (self.pid_kp, self.pid_ki, self.pid_kd)):
+            raise ValueError("PID gains must be finite and non-negative")
         self._clock = clock
         self._started_at = clock()
         self._generated_events: deque[tuple[float, int]] = deque()
@@ -53,6 +75,10 @@ class AdaptiveBackpressureController:
         self._tokens = 0.0
         self._token_rate: float | None = None
         self._last_token_update = self._started_at
+        self.reward_backlog_samples = 0
+        self._pid_integral = 0.0
+        self._pid_previous_error = 0.0
+        self._pid_previous_time = self._started_at
 
     def record_generated(self, count: int, *, now: float | None = None) -> None:
         if count > 0:
@@ -80,13 +106,21 @@ class AdaptiveBackpressureController:
         return True
 
     def observe_queues(self, *, reward_samples: int, training_samples: int) -> tuple[str, ...]:
+        self.reward_backlog_samples = max(0, int(reward_samples))
+        if self.reward_backlog_samples <= self.reward_low_watermark_samples:
+            self._pid_integral = 0.0
+            self._pid_previous_error = 0.0
+            self._pid_previous_time = self._clock()
         if self.queue_pause_reasons:
-            if reward_samples <= self.low_watermark_samples and training_samples <= self.low_watermark_samples:
+            if (
+                reward_samples <= self.reward_low_watermark_samples
+                and training_samples <= self.low_watermark_samples
+            ):
                 self.queue_pause_reasons = ()
             return self.queue_pause_reasons
 
         reasons = []
-        if reward_samples >= self.high_watermark_samples:
+        if reward_samples >= self.reward_hard_watermark_samples:
             reasons.append("reward_backpressure")
         if training_samples >= self.high_watermark_samples:
             reasons.append("trainer_backpressure")
@@ -124,10 +158,15 @@ class AdaptiveBackpressureController:
         )
 
     def target_rate(self, *, now: float | None = None) -> float | None:
+        now = self._clock() if now is None else now
         self.rates(now=now)
         if self.reward_capacity_samples_per_s is None or self.trainer_samples_per_s is None:
             return None
-        return self.rate_multiplier * min(self.reward_capacity_samples_per_s, self.trainer_samples_per_s)
+        base_rate = self.rate_multiplier * min(self.reward_capacity_samples_per_s, self.trainer_samples_per_s)
+        if self.reward_backlog_samples < self.reward_low_watermark_samples:
+            return None
+        control = self._pid_control(now)
+        return base_rate * max(0.0, 1.0 - control)
 
     def try_admit(self, *, now: float | None = None) -> bool:
         now = self._clock() if now is None else now
@@ -148,10 +187,27 @@ class AdaptiveBackpressureController:
         self.rate_limited = False
         return True
 
+    def _pid_control(self, now: float) -> float:
+        """Return a clamped [0, 1] throttle for the soft-to-hard backlog band."""
+        span = self.reward_hard_watermark_samples - self.reward_low_watermark_samples
+        error = (self.reward_backlog_samples - self.reward_low_watermark_samples) / span
+        error = min(1.0, max(0.0, error))
+        elapsed = max(1e-6, now - self._pid_previous_time)
+        self._pid_integral = min(10.0, max(0.0, self._pid_integral + error * elapsed))
+        derivative = (error - self._pid_previous_error) / elapsed
+        self._pid_previous_error = error
+        self._pid_previous_time = now
+        return min(1.0, max(0.0, self.pid_kp * error + self.pid_ki * self._pid_integral + self.pid_kd * derivative))
+
     def pressure_reasons(self, *, now: float | None = None) -> tuple[str, ...]:
         generation_rate, reward_rate = self.rates(now=now)
         reasons = set(self.queue_pause_reasons)
-        if generation_rate is not None and reward_rate is not None and generation_rate > reward_rate:
+        if (
+            self.reward_backlog_samples >= self.reward_low_watermark_samples
+            and generation_rate is not None
+            and reward_rate is not None
+            and generation_rate > reward_rate
+        ):
             reasons.add("reward_backpressure")
         if (
             generation_rate is not None
@@ -183,6 +239,8 @@ class AdaptiveBackpressureController:
             "fully_async/backpressure_rate_window_seconds": self.rate_window_seconds,
             "fully_async/backpressure_high_watermark_samples": self.high_watermark_samples,
             "fully_async/backpressure_low_watermark_samples": self.low_watermark_samples,
+            "fully_async/reward_soft_watermark_samples": self.reward_low_watermark_samples,
+            "fully_async/reward_hard_watermark_samples": self.reward_hard_watermark_samples,
         }
 
     def _prune(self, now: float) -> None:

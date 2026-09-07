@@ -41,6 +41,7 @@ def test_target_uses_95_percent_of_slower_downstream_rate_after_warmup():
     controller = _controller(clock)
     controller.record_generated(120)
     controller.record_rewarded(60)
+    controller.observe_queues(reward_samples=50, training_samples=0)
     assert controller.report_trainer_performance(step_time=30, effective_batch_size=90)
 
     clock.now = 29.9
@@ -61,6 +62,7 @@ def test_token_bucket_limits_admission_without_cancelling_work():
     clock = FakeClock()
     controller = _controller(clock)
     controller.record_rewarded(60)
+    controller.observe_queues(reward_samples=50, training_samples=0)
     controller.report_trainer_performance(step_time=10, effective_batch_size=100)
     clock.now = 30.0
     controller.observe_reward_capacity(saturated=True)
@@ -97,6 +99,7 @@ def test_reward_capacity_freezes_when_generation_becomes_demand_limited():
     controller = _controller(clock)
     controller.record_generated(120)
     controller.record_rewarded(60)
+    controller.observe_queues(reward_samples=50, training_samples=0)
     controller.report_trainer_performance(step_time=10, effective_batch_size=100)
     clock.now = 30.0
     controller.observe_reward_capacity(saturated=True)
@@ -109,3 +112,27 @@ def test_reward_capacity_freezes_when_generation_becomes_demand_limited():
 
     assert controller.reward_capacity_samples_per_s == pytest.approx(2.0)
     assert controller.target_rate() == pytest.approx(1.9)
+
+
+def test_reward_backpressure_has_soft_and_hard_watermarks():
+    clock = FakeClock()
+    controller = _controller(
+        clock,
+        reward_low_watermark_samples=1600,
+        reward_hard_watermark_samples=4096,
+        high_watermark_samples=4096,
+    )
+    controller.report_trainer_performance(step_time=1, effective_batch_size=100)
+    controller.reward_capacity_samples_per_s = 100.0
+
+    controller.observe_queues(reward_samples=1599, training_samples=0)
+    assert controller.try_admit()
+    assert controller.target_rate() is None
+
+    controller.observe_queues(reward_samples=2800, training_samples=0)
+    clock.now = 1.0
+    assert controller.target_rate() is not None
+    assert 0 < controller.target_rate() < 95
+
+    controller.observe_queues(reward_samples=4096, training_samples=0)
+    assert not controller.try_admit()

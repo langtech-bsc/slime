@@ -6,7 +6,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from slime.rollout.fully_async_rollout import AsyncRolloutWorker, GroupState
+from slime.rollout.fully_async_rollout import AsyncRolloutWorker, GroupState, _rollout_group_sort_key
 from slime.utils.types import Sample
 
 
@@ -81,6 +81,91 @@ async def _wait_for(predicate, *, timeout: float = 2.0):
             return
         await asyncio.sleep(0.01)
     raise AssertionError("condition was not reached before timeout")
+
+
+@pytest.mark.unit
+def test_fully_async_rollout_group_sort_key_handles_nested_segments():
+    groups = [
+        [[Sample(index=7), Sample(index=7)]],
+        [[Sample(index=2)]],
+        [Sample(index=None), [Sample(index=5)]],
+    ]
+
+    assert sorted(groups, key=_rollout_group_sort_key) == [groups[1], groups[2], groups[0]]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("multi_turn", [False, True])
+def test_fully_async_publishes_pre_rewarded_attempts_without_flattening(monkeypatch, multi_turn):
+    from slime.rollout import fully_async_rollout
+
+    monkeypatch.setattr(fully_async_rollout, "GenerateState", _FakeGenerateState)
+    generated_units = {}
+
+    async def fake_generate(args, sample, sampling_params, evaluation=False):
+        # Unequal trajectory lengths must not weight reward spread by turns.
+        segments = []
+        for turn in range(sample.index + 1 if multi_turn else 1):
+            segment = Sample(
+                index=sample.index,
+                rollout_id=sample.index,
+                group_index=0,
+                prompt=f"prompt-{sample.index}-turn-{turn}",
+                response="done",
+                response_length=1,
+                tokens=[sample.index, turn],
+                rollout_log_probs=[-0.25],
+                loss_mask=[1],
+                reward=float(sample.index == 0),
+                status=Sample.Status.COMPLETED,
+            )
+            segments.append(segment)
+        generated_units[sample.index] = segments if multi_turn else segments[0]
+        return generated_units[sample.index]
+
+    async def unexpected_rm(*args, **kwargs):
+        raise AssertionError("pre-rewarded SWE segments must not be scored again")
+
+    monkeypatch.setattr(fully_async_rollout, "generate_sample_only", fake_generate)
+    monkeypatch.setattr(fully_async_rollout, "async_rm", unexpected_rm)
+    monkeypatch.setattr(fully_async_rollout, "batched_async_rm", unexpected_rm)
+    handle_reward_done = AsyncRolloutWorker._handle_reward_done
+    completed_active_reward_counts = []
+
+    def check_reward_done(self, task, gid, sample_idx, groups):
+        handle_reward_done(self, task, gid, sample_idx, groups)
+        group = groups.get(gid)
+        if group is not None and group.rewarded_count == len(group.samples):
+            completed_active_reward_counts.append(group.active_reward_count)
+
+    monkeypatch.setattr(AsyncRolloutWorker, "_handle_reward_done", check_reward_done)
+
+    async def run_case():
+        worker = AsyncRolloutWorker(
+            _args(rollout_batch_size=1),
+            _FiniteDataSource(groups=1, group_size=2),
+            generation_concurrency=2,
+            reward_concurrency=2,
+            max_reward_backlog_groups=8,
+        )
+        task = asyncio.create_task(worker._loop())
+        try:
+            await _wait_for(lambda: task.done() or worker.queue_size() == 1)
+            if task.done():
+                await task  # Surface the original worker exception immediately.
+            completed = worker.get_completed_groups()
+            assert len(completed) == 1
+            _, units = completed[0]
+            assert units == [generated_units[0], generated_units[1]]
+            assert units[0] is generated_units[0]
+            assert units[1] is generated_units[1]
+            assert completed_active_reward_counts == [0]
+            assert worker.reward_computation_tracker.consume_window_mean_group_reward_std() == 0.5
+        finally:
+            worker.running = False
+            await task
+
+    asyncio.run(run_case())
 
 
 @pytest.mark.unit
@@ -159,6 +244,7 @@ def test_fully_async_rewards_already_completed_unrewarded_sample(monkeypatch):
             generation_concurrency=1,
             reward_concurrency=1,
             max_reward_backlog_groups=8,
+            backpressure_high_watermark_samples=2,
             max_inference_groups=99,
             max_reward_groups=99,
         )
@@ -224,7 +310,8 @@ def test_fully_async_requeued_aborted_group_preserves_trajectory_for_resume(monk
 
 
 @pytest.mark.unit
-def test_fully_async_drops_overlength_generated_sample_before_reward(monkeypatch):
+@pytest.mark.parametrize("empty_trajectory", [False, True])
+def test_fully_async_drops_invalid_generated_unit_before_reward(monkeypatch, empty_trajectory):
     from collections import deque
 
     from slime.rollout import fully_async_rollout
@@ -249,7 +336,7 @@ def test_fully_async_drops_overlength_generated_sample_before_reward(monkeypatch
     pending_reward = deque()
 
     async def done():
-        return sample
+        return [] if empty_trajectory else sample
 
     async def run_case():
         task = asyncio.create_task(done())

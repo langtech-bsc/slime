@@ -31,6 +31,7 @@ from collections import deque
 from dataclasses import dataclass, field
 import logging
 import math
+from numbers import Integral
 from queue import Empty
 import threading
 import time
@@ -395,7 +396,9 @@ class AsyncRolloutWorker:
                         break
                     gid, sample_idx, sample_or_group = item
                     group_state = groups[gid]
-                    group_state.active_reward_count += len(sample_or_group) if isinstance(sample_or_group, list) else 1
+                    # Count source attempts, matching _handle_reward_done, even
+                    # when one attempt expands into several training segments.
+                    group_state.active_reward_count += len(group_state.samples) if sample_idx is None else 1
                     task = asyncio.create_task(self._reward_sample_or_group(sample_or_group))
                     active_reward[task] = (gid, sample_idx)
                     serving_gids = _reward_serving_group_ids(groups)
@@ -621,8 +624,12 @@ class AsyncRolloutWorker:
             if any(item is None for item in result):
                 logger.error("fully-async: refusing to publish incomplete group gid=%s", gid)
                 continue
+            # A custom generator may return several training segments for one
+            # attempt. Keep that nesting for training, but measure reward spread
+            # once per attempt so longer trajectories do not get extra weight.
             self.reward_computation_tracker.record_group_rewards(
-                sample.get_reward_value(self.args) for sample in result
+                (unit[0] if isinstance(unit, list) else unit).get_reward_value(self.args)
+                for unit in result
             )
             self.training_output_queue.put(gid, result)
 
@@ -885,15 +892,11 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> Rollout
             )
             last_log = now
 
-    # Order by sample.index for determinism (slime convention).
-    def _key(group: list[Sample]) -> int:
-        for s in group:
-            idx = getattr(s, "index", None)
-            if idx is not None:
-                return int(idx)
-        return 0
-
-    out = sorted(collected.values(), key=_key)[:target]
+    # Order by the first sample index for determinism (slime convention).
+    # A generated attempt can contain several training segments, so groups
+    # may be nested as list[Sample | list[Sample]]. In that case the attempt
+    # list's ``index`` attribute is a method, not a sample index.
+    out = sorted(collected.values(), key=_rollout_group_sort_key)[:target]
     logger.info(
         "fully-async rollout %d: done in %.1fs, queue_left=%d",
         rollout_id,
@@ -980,7 +983,23 @@ def _iter_samples(sample_or_group: Sample | list[Sample]):
         yield sample_or_group
 
 
+def _rollout_group_sort_key(group: list[Sample | list[Sample]]) -> int:
+    """Return a group's first numeric sample index, including nested segments."""
+    pending = list(reversed(group))
+    while pending:
+        item = pending.pop()
+        if isinstance(item, list):
+            pending.extend(reversed(item))
+            continue
+        index = getattr(item, "index", None)
+        if isinstance(index, Integral):
+            return int(index)
+    return 0
+
+
 def _invalid_generated_unit_reason(args, sample_or_group: Sample | list[Sample]) -> str | None:
+    if isinstance(sample_or_group, list) and not sample_or_group:
+        return "custom generator returned no training samples"
     for sample in _iter_samples(sample_or_group):
         rollout_max_response_len = getattr(args, "rollout_max_response_len", None)
         rollout_max_context_len = getattr(args, "rollout_max_context_len", None)

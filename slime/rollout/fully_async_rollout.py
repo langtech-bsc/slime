@@ -44,6 +44,7 @@ from slime.rollout.fully_async_backpressure import (
     DEFAULT_RATE_WINDOW_SECONDS,
     WARNING_INTERVAL_SECONDS,
 )
+from slime.rollout.engine_load_metrics import collect_engine_load_metrics
 from slime.rollout.queue_metrics import TrainingOutputQueue, compute_queue_depth
 from slime.rollout.reward_computation_metrics import (
     RewardComputationTracker,
@@ -272,6 +273,7 @@ class AsyncRolloutWorker:
         last_reward_queue_log = 0.0
         last_rate_log_at = time.time()
         last_generated_samples = 0
+        last_generated_tokens = 0
         last_rewarded_samples = 0
         last_trainer_perf_poll = 0.0
         last_backpressure_warning = 0.0
@@ -314,6 +316,11 @@ class AsyncRolloutWorker:
                     rollout_samples_per_s = (
                         self.metrics.generated_samples - last_generated_samples
                     ) / rate_elapsed
+                    rollout_tokens_per_gpu_per_s = (
+                        (self.metrics.generated_tokens - last_generated_tokens)
+                        / rate_elapsed
+                        / max(getattr(self.args, "rollout_num_gpus", None) or 1, 1)
+                    )
                     reward_samples_per_s = (
                         self.metrics.rewarded_samples - last_rewarded_samples
                     ) / rate_elapsed
@@ -345,11 +352,16 @@ class AsyncRolloutWorker:
                             oldest_wait_seconds=self.metrics.reward_oldest_pending_seconds,
                             tracker=self.reward_computation_tracker,
                         ),
-                        extra_metrics=self.backpressure.snapshot(now=monotonic_now),
+                        extra_metrics={
+                            **self.backpressure.snapshot(now=monotonic_now),
+                            "rollout_gpu/generated_tokens_per_gpu_per_sec": rollout_tokens_per_gpu_per_s,
+                            **await collect_engine_load_metrics(self.args),
+                        },
                     )
                     last_reward_queue_log = now
                     last_rate_log_at = now
                     last_generated_samples = self.metrics.generated_samples
+                    last_generated_tokens = self.metrics.generated_tokens
                     last_rewarded_samples = self.metrics.rewarded_samples
                 pressure_reasons = self.backpressure.pressure_reasons(now=monotonic_now)
                 if pressure_reasons and (
@@ -483,6 +495,9 @@ class AsyncRolloutWorker:
         group.generated_count += 1
         generated_count = _sample_count(generated)
         self.metrics.generated_samples += generated_count
+        self.metrics.generated_tokens += sum(
+            getattr(sample, "response_length", 0) or 0 for sample in _iter_samples(generated)
+        )
         self.backpressure.record_generated(generated_count)
         if _contains_aborted(generated):
             group.dropped = True
@@ -947,6 +962,7 @@ class FullyAsyncMetrics:
     generation_invalid_groups: int = 0
     reward_failed_groups: int = 0
     generated_samples: int = 0
+    generated_tokens: int = 0
     rewarded_samples: int = 0
 
     def snapshot(self) -> dict[str, float | int]:

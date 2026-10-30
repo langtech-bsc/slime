@@ -2,6 +2,7 @@ import asyncio
 import ipaddress
 import json
 import logging
+import math
 import multiprocessing
 import os
 import random
@@ -147,6 +148,14 @@ def terminate_process(process: multiprocessing.Process, timeout: float = 1.0) ->
 _http_client: httpx.AsyncClient | None = None
 _client_concurrency: int = 0
 
+# httpcore walks every request and connection of a pool whenever it assigns or
+# releases a connection, so one pool holding thousands of long SSE streams
+# costs O(pool) per event on the single rollout thread (68% of its CPU at 2,560
+# streams). Streaming requests therefore spread over pools of about this size.
+STREAM_POOL_CONNECTIONS = 256
+_stream_clients: list[httpx.AsyncClient] = []
+_stream_client_idx: int = 0
+
 # Optional Ray-based distributed POST dispatch
 _distributed_post_enabled: bool = False
 _post_actors: list[object] = []
@@ -210,6 +219,24 @@ def get_rollout_num_engines(args) -> int:
     return max(1, rollout_num_gpus // rollout_num_gpus_per_engine)
 
 
+def _new_client(max_connections: int) -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        limits=httpx.Limits(max_connections=max_connections),
+        timeout=httpx.Timeout(None),
+        trust_env=False,  # internal SGLang comm only — never route through system proxy
+    )
+
+
+def get_stream_client() -> httpx.AsyncClient | None:
+    """Client for one streaming request: the next stream pool, or the shared client."""
+    global _stream_client_idx
+    if not _stream_clients:
+        return _http_client
+    client = _stream_clients[_stream_client_idx % len(_stream_clients)]
+    _stream_client_idx += 1
+    return client
+
+
 def init_http_client(args):
     """Initialize HTTP client and optionally enable distributed POST via Ray."""
     global _http_client, _client_concurrency, _distributed_post_enabled
@@ -219,11 +246,12 @@ def init_http_client(args):
 
     _client_concurrency = args.sglang_server_concurrency * num_engines
     if _http_client is None:
-        _http_client = httpx.AsyncClient(
-            limits=httpx.Limits(max_connections=_client_concurrency),
-            timeout=httpx.Timeout(None),
-            trust_env=False,  # internal SGLang comm only — never route through system proxy
-        )
+        _http_client = _new_client(_client_concurrency)
+    shards = math.ceil(_client_concurrency / STREAM_POOL_CONNECTIONS)
+    if shards > 1 and not _stream_clients:
+        # Headroom per pool: round-robin assignment is not balanced by load.
+        per_pool = 2 * math.ceil(_client_concurrency / shards)
+        _stream_clients.extend(_new_client(per_pool) for _ in range(shards))
 
     # Optionally initialize distributed POST via Ray without changing interfaces
     if args.use_distributed_post:

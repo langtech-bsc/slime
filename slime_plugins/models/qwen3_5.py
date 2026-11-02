@@ -1,4 +1,5 @@
 import copy
+import os
 
 import torch
 import torch.nn as nn
@@ -82,6 +83,76 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         )
 
         self.out_proj = nn.Linear(self.value_dim, self.hidden_size, bias=False)
+
+    def forward_tp_sharded(
+        self,
+        hidden_states: torch.Tensor,
+        cu_seqlens: torch.Tensor,
+        tp_rank: int,
+        tp_size: int,
+    ):
+        """Head-sharded forward: this TP rank computes only its key/value heads on the full sequence.
+
+        Same parameters and maths as ``forward`` (rows/columns of the replicated weights are sliced per
+        rank), but returns a PARTIAL ``out_proj`` result that the caller must sum over the TP group
+        (a reduce-scatter in the sequence-parallel layout). Key head ``k`` serves value heads
+        ``k * rep .. (k + 1) * rep - 1``, so a rank's key and value heads line up. Parameter gradients
+        are likewise partial and are summed over TP through Megatron's ``sequence_parallel`` param flag.
+        """
+        from einops import rearrange
+        from fla.modules.conv.causal_conv1d import causal_conv1d
+
+        batch_size, seq_len, _ = hidden_states.shape
+        nk, nv = self.num_k_heads // tp_size, self.num_v_heads // tp_size
+        kd, vd = self.head_k_dim, self.head_v_dim
+        q0, v0 = tp_rank * nk * kd, tp_rank * nv * vd
+
+        def qkv_rows(w):  # rows/channels of the flat [Q_all, K_all, V_all] layout owned by this rank
+            return torch.cat(
+                [w[q0 : q0 + nk * kd], w[self.key_dim + q0 : self.key_dim + q0 + nk * kd],
+                 w[2 * self.key_dim + v0 : 2 * self.key_dim + v0 + nv * vd]],
+                dim=0,
+            )
+
+        mixed_qkv = F.linear(hidden_states, qkv_rows(self.in_proj_qkv.weight))
+        z = F.linear(hidden_states, self.in_proj_z.weight[v0 : v0 + nv * vd]).reshape(batch_size, seq_len, nv, vd)
+        b = F.linear(hidden_states, self.in_proj_b.weight[tp_rank * nv : (tp_rank + 1) * nv])
+        a = F.linear(hidden_states, self.in_proj_a.weight[tp_rank * nv : (tp_rank + 1) * nv])
+
+        mixed_qkv, _ = causal_conv1d(
+            x=mixed_qkv,
+            weight=rearrange(qkv_rows(self.conv1d.weight), "d 1 w -> d w"),
+            bias=None,
+            residual=None,
+            initial_state=None,
+            output_final_state=False,
+            activation=self.conv1d.activation,
+            backend=self.conv1d.backend,
+            cu_seqlens=cu_seqlens,
+        )
+        query, key, value = torch.split(mixed_qkv, [nk * kd, nk * kd, nv * vd], dim=-1)
+        query = query.reshape(batch_size, seq_len, nk, kd)
+        key = key.reshape(batch_size, seq_len, nk, kd)
+        value = value.reshape(batch_size, seq_len, nv, vd)
+
+        beta = b.sigmoid()
+        sl = slice(tp_rank * nv, (tp_rank + 1) * nv)
+        g = -self.A_log[sl].float().exp() * F.softplus(a.float() + self.dt_bias[sl])
+        rep = self.num_v_heads // self.num_k_heads
+        if rep > 1:
+            query = query.repeat_interleave(rep, dim=2)
+            key = key.repeat_interleave(rep, dim=2)
+        if self.gdn_backend == "flashqla":
+            query, key, value, g, beta = (t.contiguous() for t in (query, key, value, g, beta))
+
+        core_attn_out, _ = self.chunk_gated_delta_rule(
+            query, key, value, g=g, beta=beta, initial_state=None, output_final_state=False,
+            use_qk_l2norm_in_kernel=True, cu_seqlens=cu_seqlens,
+        )
+        z_shape_og = z.shape
+        core_attn_out = self.norm(core_attn_out.reshape(-1, core_attn_out.shape[-1]), z.reshape(-1, z.shape[-1]))
+        core_attn_out = core_attn_out.reshape(z_shape_og).reshape(batch_size, seq_len, -1)
+        return F.linear(core_attn_out, self.out_proj.weight[:, v0 : v0 + nv * vd])  # partial over TP
 
     def forward(
         self,
@@ -183,7 +254,33 @@ class Attention(HuggingfaceAttention):
 
             self.input_layernorm = RMSNorm(self.hf_config.hidden_size, eps=self.hf_config.rms_norm_eps)
 
+        # Opt-in head sharding of the GDN over the TP group (THC_GDN_TP_SHARD=1): each TP rank computes
+        # 1/TP of the heads on the full sequence instead of all heads redundantly. Parameters stay replicated
+        # (same checkpoint); their gradients become per-rank partials, so flag them like Megatron's
+        # sequence-parallel params (grads all-reduced over TP).
+        from megatron.core import mpu
+
+        self.gdn_tp_sharded = False
+        tp = mpu.get_tensor_model_parallel_world_size()
+        if os.environ.get("THC_GDN_TP_SHARD", "0") == "1" and tp > 1:
+            assert args.sequence_parallel, "THC_GDN_TP_SHARD needs --sequence-parallel"
+            cfg = self.linear_attn
+            assert cfg.num_k_heads % tp == 0 and cfg.num_v_heads % tp == 0, "GDN heads must divide by TP"
+            self.gdn_tp_sharded = True
+            for p in self.parameters():
+                p.sequence_parallel = True
+
     def hf_forward(self, hidden_states, packed_seq_params):
+        if self.gdn_tp_sharded:
+            from megatron.core import mpu
+
+            # input_layernorm already ran on the local sequence shard in HuggingfaceAttention.forward
+            return self.linear_attn.forward_tp_sharded(
+                hidden_states,
+                packed_seq_params.cu_seqlens_q,
+                mpu.get_tensor_model_parallel_rank(),
+                mpu.get_tensor_model_parallel_world_size(),
+            )
         hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.linear_attn(
             hidden_states=hidden_states,

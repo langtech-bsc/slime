@@ -874,6 +874,37 @@ def icepop_function(
     return pg_loss, loss_masks, metrics
 
 
+_THC_DUMP_COUNTER = 0
+
+
+def _thc_dump_logprobs(args: Namespace, unconcat_tokens, log_probs) -> None:
+    """Diagnostic, active only with --save-debug-train-data: per-sample trainer log-probs.
+
+    Samples are keyed by a hash of their token ids so two runs with different packing or rank
+    assignment can be compared token by token. One file per micro-batch under
+    <dirname(save_debug_train_data)>/logprobs, written by TP rank 0 only (TP ranks hold
+    identical copies). Meaningful for context_parallel_size == 1 (no CP slicing).
+    """
+    global _THC_DUMP_COUNTER
+    if mpu.get_tensor_model_parallel_rank() != 0:
+        return
+    import hashlib
+    from pathlib import Path
+
+    out_dir = Path(args.save_debug_train_data.format(rollout_id=0, rank=0)).parent / "logprobs"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    records = [
+        (
+            hashlib.sha1(toks.detach().cpu().numpy().tobytes()).hexdigest()[:16],
+            int(toks.numel()),
+            lp.detach().float().cpu(),
+        )
+        for toks, lp in zip(unconcat_tokens, log_probs, strict=False)
+    ]
+    _THC_DUMP_COUNTER += 1
+    torch.save(records, out_dir / f"r{torch.distributed.get_rank()}_{_THC_DUMP_COUNTER}.pt")
+
+
 def policy_loss_function(
     args: Namespace,
     batch: RolloutBatch,
@@ -922,6 +953,8 @@ def policy_loss_function(
     )
 
     log_probs = log_probs_and_entropy["log_probs"]
+    if getattr(args, "save_debug_train_data", None) is not None:
+        _thc_dump_logprobs(args, batch["unconcat_tokens"], log_probs)
     if not args.use_rollout_logprobs and not old_log_probs:
         old_log_probs = [log_prob.detach() for log_prob in log_probs]
     train_log_probs_for_tis = batch.get("log_probs")

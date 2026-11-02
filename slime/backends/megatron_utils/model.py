@@ -1,8 +1,10 @@
 import dataclasses
 import gc
+import json
 import logging
 import math
 import os
+import time
 from argparse import Namespace
 from collections.abc import Callable, Sequence
 from functools import partial
@@ -573,6 +575,9 @@ def train_one_step(
 
     # Forward pass.
     forward_backward_func = get_forward_backward_func()
+    # Log-only phase timers (synchronised so they measure GPU work, not launch time).
+    torch.cuda.synchronize()
+    _thc_t0 = time.perf_counter()
     losses_reduced = forward_backward_func(
         forward_step_func=_wrap_forward_step_with_microbatch_pbar(forward_step, microbatch_pbar),
         data_iterator=data_iterator,
@@ -583,6 +588,8 @@ def train_one_step(
         decoder_seq_length=args.decoder_seq_length,
         forward_only=False,
     )
+    torch.cuda.synchronize()
+    _thc_t1 = time.perf_counter()
 
     valid_step = True
     grad_norm = float("nan")
@@ -607,6 +614,24 @@ def train_one_step(
     if valid_step:
         # Update parameters.
         update_successful, grad_norm, num_zeros_in_grad = optimizer.step()
+        torch.cuda.synchronize()
+        print(
+            "THC_PROBE "
+            + json.dumps(
+                {
+                    "phase": "step_breakdown",
+                    "rollout_id": rollout_id,
+                    "step_id": step_id,
+                    "dp": mpu.get_data_parallel_rank(),
+                    "tp": mpu.get_tensor_model_parallel_rank(),
+                    "cp": mpu.get_context_parallel_rank(),
+                    "fwd_bwd_incl_grad_sync_s": round(_thc_t1 - _thc_t0, 3),
+                    "optimizer_step_s": round(time.perf_counter() - _thc_t1, 3),
+                    "num_microbatches": int(num_microbatches),
+                }
+            ),
+            flush=True,
+        )
 
         # Update learning rate. Use the per-step global_batch_size when dynamic
         # batching is on so the scheduler's samples-seen counter tracks reality.

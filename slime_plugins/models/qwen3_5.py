@@ -271,16 +271,17 @@ class Attention(HuggingfaceAttention):
                 p.sequence_parallel = True
 
     def hf_forward(self, hidden_states, packed_seq_params):
-        hidden_states = self.input_layernorm(hidden_states)
         if self.gdn_tp_sharded:
             from megatron.core import mpu
 
+            # input_layernorm already ran on the local sequence shard in HuggingfaceAttention.forward
             return self.linear_attn.forward_tp_sharded(
                 hidden_states,
                 packed_seq_params.cu_seqlens_q,
                 mpu.get_tensor_model_parallel_rank(),
                 mpu.get_tensor_model_parallel_world_size(),
             )
+        hidden_states = self.input_layernorm(hidden_states)
         hidden_states = self.linear_attn(
             hidden_states=hidden_states,
             cu_seqlens=packed_seq_params.cu_seqlens_q,

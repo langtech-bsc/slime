@@ -108,6 +108,11 @@ class HuggingfaceAttention(MegatronModule, ABC):
         # full sequence and returns a PARTIAL output, so the input-gradient must be reduce-scattered and
         # the output must be reduce-scattered (summed) instead of just sliced.
         tp_sharded = bool(getattr(self, "gdn_tp_sharded", False))
+        if tp_sharded:
+            # Per-token RMSNorm commutes with the sequence all-gather: run it on the local sequence shard
+            # (1/TP of the tokens, 1/TP of the fp32 upcast memory) like any sequence-parallel layernorm.
+            # Its weight gradient is then a per-rank partial, summed over TP via the sequence_parallel flag.
+            hidden_states = self.input_layernorm(hidden_states)
         if self.args.sequence_parallel:
             # tensor_parallel_output_grad=False: the linear attention after this
             # gather is NOT TP-sharded (duplicated on all ranks), so the backward

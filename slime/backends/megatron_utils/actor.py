@@ -1,3 +1,4 @@
+import json
 import logging
 import os
 import random
@@ -43,6 +44,29 @@ from .update_weight.update_weight_from_tensor import UpdateWeightFromTensor
 logging.getLogger("megatron").setLevel(logging.WARNING)
 
 logger = logging.getLogger(__name__)
+
+
+def _thc_probe(phase: str, rollout_id: int, rollout_data, num_microbatches) -> None:
+    """Log-only trainer probe: per-rank peak CUDA memory, local token load and microbatch count.
+
+    Emits one ``THC_PROBE {json}`` line per rank and phase; parsed by trainer-hill-climber's
+    summarize_run.py. Resets the peak counters so each phase reports its own peak.
+    """
+    lengths = rollout_data.get("total_lengths") or []
+    record = {
+        "phase": phase,
+        "rollout_id": rollout_id,
+        "tp": mpu.get_tensor_model_parallel_rank(),
+        "dp": mpu.get_data_parallel_rank(),
+        "cp": mpu.get_context_parallel_rank(),
+        "peak_alloc_gb": round(torch.cuda.max_memory_allocated() / 2**30, 2),
+        "peak_reserved_gb": round(torch.cuda.max_memory_reserved() / 2**30, 2),
+        "local_samples": len(lengths),
+        "local_tokens": int(sum(lengths)),
+        "num_microbatches": [int(n) for n in num_microbatches],
+    }
+    torch.cuda.reset_peak_memory_stats()
+    print("THC_PROBE " + json.dumps(record), flush=True)
 
 
 class MegatronTrainRayActor(TrainRayActor):
@@ -589,6 +613,8 @@ class MegatronTrainRayActor(TrainRayActor):
             # Train
             if self.args.use_routing_replay:
                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"
+            # Anything before this point (log-prob passes) is reported as its own phase.
+            _thc_probe("pre_actor_train", rollout_id, rollout_data, num_microbatches)
             with timer("actor_train"):
                 train(
                     rollout_id,
@@ -599,6 +625,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     num_microbatches,
                     global_batch_sizes,
                 )
+            _thc_probe("actor_train", rollout_id, rollout_data, num_microbatches)
 
             self.prof.step(rollout_id=rollout_id)
 

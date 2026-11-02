@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from collections import Counter
+from collections.abc import Callable
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -28,27 +29,65 @@ class DegenerationSignal:
         return asdict(self)
 
 
-def trailing_fence_count(text: str) -> int:
-    lines = [line.strip() for line in (text or "").rstrip().splitlines()]
+def _rstrip_end(text: str) -> int:
+    end = len(text)
+    while end and text[end - 1].isspace():
+        end -= 1
+    return end
+
+
+def _trailing_run(text: str, run_length: Callable[[list[str]], tuple[int, bool]]) -> int:
+    """Apply ``run_length`` to the lines of ``text.rstrip()`` without splitting all of it.
+
+    ``run_length`` returns the run counted from the last line and whether the
+    run stopped on a line that breaks it. The tail window doubles until that
+    happens on a complete line, so the result equals scanning the whole text
+    while streaming checks stay proportional to the tail.
+    """
+
+    text = text or ""
+    end = _rstrip_end(text)
+    window = DEFAULT_TAIL_CHARS
+    while window < end:
+        # The first line of a cut window may be partial; never count it.
+        lines = text[end - window : end].splitlines()[1:]
+        count, stopped = run_length(lines)
+        if stopped:
+            return count
+        window *= 2
+    return run_length(text[:end].splitlines())[0]
+
+
+def _fence_run(lines: list[str]) -> tuple[int, bool]:
     count = 0
     for line in reversed(lines):
-        if line != "```":
-            break
+        if line.strip() != "```":
+            return count, True
         count += 1
-    return count
+    return count, False
+
+
+def _repeated_line_run(lines: list[str]) -> tuple[int, bool]:
+    last = None
+    count = 0
+    for line in reversed(lines):
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if last is None:
+            last = stripped
+        elif stripped != last:
+            return count, True
+        count += 1
+    return count, False
+
+
+def trailing_fence_count(text: str) -> int:
+    return _trailing_run(text, _fence_run)
 
 
 def tail_repeated_line_count(text: str) -> int:
-    lines = [line.strip() for line in (text or "").rstrip().splitlines() if line.strip()]
-    if not lines:
-        return 0
-    last = lines[-1]
-    count = 0
-    for line in reversed(lines):
-        if line != last:
-            break
-        count += 1
-    return count
+    return _trailing_run(text, _repeated_line_run)
 
 
 def top_non_space_char_fraction(text: str, *, tail_chars: int = DEFAULT_TAIL_CHARS) -> float:

@@ -544,6 +544,12 @@ def get_log_probs_and_entropy(
     res = {"log_probs": log_probs_list}
     if with_entropy:
         res["entropy"] = entropy_list
+    if getattr(args, "save_debug_train_data", None) is not None and not args.allgather_cp:
+        # Diagnostic only: log of the probability mass inside the sampler's top-k, per response token.
+        topk_full = _thc_topk_logmass(logits, tp_group, int(getattr(args, "rollout_top_k", 0) or 20))
+        res["thc_topk_logmass"], _ = _extract_per_sample(
+            topk_full, None, total_lengths, response_lengths, args.allgather_cp
+        )
 
     # we need to turn the all gather kv into zigzag ring attn kv
     if args.allgather_cp:
@@ -877,7 +883,31 @@ def icepop_function(
 _THC_DUMP_COUNTER = 0
 
 
-def _thc_dump_logprobs(args: Namespace, unconcat_tokens, log_probs) -> None:
+@torch.no_grad()
+def _thc_topk_logmass(logits: torch.Tensor, tp_group, k: int, chunk: int = 2048) -> torch.Tensor:
+    """log(sum of the k largest probabilities) per row of vocab-parallel logits [T, V/TP].
+
+    Equals -(offset) between a log-prob under the full softmax and one renormalised over the
+    sampler's top-k. Diagnostic only; chunked so it adds no large temporaries.
+    """
+    tp = torch.distributed.get_world_size(tp_group)
+    out = torch.empty(logits.size(0), dtype=torch.float32, device=logits.device)
+    for s in range(0, logits.size(0), chunk):
+        x = logits[s : s + chunk]
+        lse = torch.logsumexp(x, dim=-1)
+        top = torch.topk(x, k, dim=-1).values.contiguous()
+        if tp > 1:
+            lses = [torch.empty_like(lse) for _ in range(tp)]
+            torch.distributed.all_gather(lses, lse, group=tp_group)
+            lse = torch.logsumexp(torch.stack(lses, 0), dim=0)
+            tops = [torch.empty_like(top) for _ in range(tp)]
+            torch.distributed.all_gather(tops, top, group=tp_group)
+            top = torch.topk(torch.cat(tops, dim=-1), k, dim=-1).values
+        out[s : s + chunk] = torch.logsumexp(top, dim=-1) - lse
+    return out
+
+
+def _thc_dump_logprobs(args: Namespace, unconcat_tokens, log_probs, topk_logmass=None) -> None:
     """Diagnostic, active only with --save-debug-train-data: per-sample trainer log-probs.
 
     Samples are keyed by a hash of their token ids so two runs with different packing or rank
@@ -893,13 +923,15 @@ def _thc_dump_logprobs(args: Namespace, unconcat_tokens, log_probs) -> None:
 
     out_dir = Path(args.save_debug_train_data.format(rollout_id=0, rank=0)).parent / "logprobs"
     out_dir.mkdir(parents=True, exist_ok=True)
+    topk = topk_logmass if topk_logmass is not None else [None] * len(log_probs)
     records = [
         (
             hashlib.sha1(toks.detach().cpu().numpy().tobytes()).hexdigest()[:16],
             int(toks.numel()),
             lp.detach().float().cpu(),
+            None if tk is None else tk.detach().float().cpu(),
         )
-        for toks, lp in zip(unconcat_tokens, log_probs, strict=False)
+        for toks, lp, tk in zip(unconcat_tokens, log_probs, topk, strict=False)
     ]
     _THC_DUMP_COUNTER += 1
     torch.save(records, out_dir / f"r{torch.distributed.get_rank()}_{_THC_DUMP_COUNTER}.pt")
@@ -954,7 +986,7 @@ def policy_loss_function(
 
     log_probs = log_probs_and_entropy["log_probs"]
     if getattr(args, "save_debug_train_data", None) is not None:
-        _thc_dump_logprobs(args, batch["unconcat_tokens"], log_probs)
+        _thc_dump_logprobs(args, batch["unconcat_tokens"], log_probs, log_probs_and_entropy.get("thc_topk_logmass"))
     if not args.use_rollout_logprobs and not old_log_probs:
         old_log_probs = [log_prob.detach() for log_prob in log_probs]
     train_log_probs_for_tis = batch.get("log_probs")

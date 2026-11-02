@@ -233,6 +233,18 @@ def setup_model_and_optimizer(
 
     model = get_model(get_model_provider_func(args, role), ModelType.encoder_or_decoder)
 
+    from . import chunked_lm_head
+
+    if chunked_lm_head.enabled():
+        assert role == "actor", "THC_CHUNKED_LM_HEAD supports the actor policy head only"
+        patched = 0
+        for chunk in model:
+            inner = chunk
+            while hasattr(inner, "module"):  # DDP -> Float16Module -> GPTModel
+                inner = inner.module
+            patched += int(chunked_lm_head.patch_output_layer(inner))
+        logger.info(f"THC_CHUNKED_LM_HEAD={chunked_lm_head.chunk_size()}: patched {patched} output layer(s)")
+
     # Optimizer
     kwargs = {}
     for f in dataclasses.fields(OptimizerConfig):

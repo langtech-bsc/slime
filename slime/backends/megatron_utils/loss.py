@@ -489,6 +489,34 @@ def get_log_probs_and_entropy(
     skip entropy and avoid an extra ``logits.clone()`` during training.
     """
     assert non_loss_data
+    from . import chunked_lm_head
+
+    if chunked_lm_head.enabled():
+        # `logits` is actually the final hidden states [1, T, H]; see chunked_lm_head.py.
+        if with_entropy or top_p_token_ids is not None or top_p_token_offsets is not None:
+            raise NotImplementedError("THC_CHUNKED_LM_HEAD supports neither entropy nor rollout top-p replay")
+        hidden = logits.squeeze(0)
+        T, device = hidden.size(0), hidden.device
+        full_tokens = _build_shifted_tokens(
+            T, device, unconcat_tokens, total_lengths, response_lengths, args.allgather_cp
+        )
+        log_prob_full = chunked_lm_head.chunked_log_probs(
+            hidden,
+            chunked_lm_head.lm_head_weight(),
+            full_tokens,
+            mpu.get_tensor_model_parallel_group(),
+            getattr(args, "rollout_temperature", 1.0),
+        )
+        log_probs_list, _ = _extract_per_sample(
+            log_prob_full, None, total_lengths, response_lengths, args.allgather_cp
+        )
+        res = {"log_probs": log_probs_list}
+        if args.allgather_cp:
+            _allgather_cp_redistribute(
+                res, logits_local_len=T, total_lengths=total_lengths, response_lengths=response_lengths
+            )
+        return torch.empty((0,), device=device), res
+
     assert logits.dtype == torch.float32, f"{logits.dtype}"
     assert len(logits.shape) == 3, f"{logits.shape}"
     assert logits.size(0) == 1, f"{logits.shape}"

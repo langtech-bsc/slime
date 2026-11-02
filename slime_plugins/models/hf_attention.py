@@ -104,13 +104,17 @@ class HuggingfaceAttention(MegatronModule, ABC):
         assert packed_seq_params is not None
         cu_seqlens = packed_seq_params.cu_seqlens_q
 
+        # Head-sharded linear attention (THC_GDN_TP_SHARD): each TP rank computes only its heads on the
+        # full sequence and returns a PARTIAL output, so the input-gradient must be reduce-scattered and
+        # the output must be reduce-scattered (summed) instead of just sliced.
+        tp_sharded = bool(getattr(self, "gdn_tp_sharded", False))
         if self.args.sequence_parallel:
             # tensor_parallel_output_grad=False: the linear attention after this
             # gather is NOT TP-sharded (duplicated on all ranks), so the backward
             # should split (not reduce-scatter) to avoid inflating gradients by TP.
             hidden_states = tensor_parallel.gather_from_sequence_parallel_region(
                 hidden_states,
-                tensor_parallel_output_grad=False,
+                tensor_parallel_output_grad=tp_sharded,
                 group=mpu.get_tensor_model_parallel_group(),
             )
 
@@ -162,9 +166,14 @@ class HuggingfaceAttention(MegatronModule, ABC):
             output = torch.cat(output_list, dim=0)
 
         if self.args.sequence_parallel:
-            output = tensor_parallel.scatter_to_sequence_parallel_region(
-                output, group=mpu.get_tensor_model_parallel_group()
-            )
+            if tp_sharded:
+                output = tensor_parallel.reduce_scatter_to_sequence_parallel_region(
+                    output, group=mpu.get_tensor_model_parallel_group()
+                )
+            else:
+                output = tensor_parallel.scatter_to_sequence_parallel_region(
+                    output, group=mpu.get_tensor_model_parallel_group()
+                )
 
         return output, bias
 

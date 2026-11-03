@@ -37,7 +37,9 @@ def compute_queue_depth(
     training_queue_samples: int,
 ) -> QueueDepthSnapshot:
     del groups
-    reward_samples = len(pending_generation) + len(active_generation) + reward_backlog_samples
+    # Generation is upstream of reward and must not inflate reward pressure.
+    del pending_generation, active_generation
+    reward_samples = reward_backlog_samples
     return QueueDepthSnapshot(
         reward_samples=reward_samples,
         training_samples=training_queue_samples,

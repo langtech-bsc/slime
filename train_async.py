@@ -14,6 +14,9 @@ from slime.utils.misc import should_run_periodic_action
 
 
 _FULLY_ASYNC_ROLLOUT_PATH = "slime.rollout.fully_async_rollout.generate_rollout_fully_async"
+_FULLY_ASYNC_ROLLOUT_PATHS = frozenset(
+    {_FULLY_ASYNC_ROLLOUT_PATH, "reward_functions.rollout_wrapper.generate_rollout_fully_async"}
+)
 logger = logging.getLogger(__name__)
 
 
@@ -32,10 +35,9 @@ def _prepare_train_data_with_recovery(
 ):
     """Prepare a batch, replacing fully filtered batches in fully-async mode.
 
-    ``rollout_data_next_future`` is the normal async lookahead. Reusing it as
-    the replacement avoids advancing the data source twice when the current
-    batch is discarded. A replacement is requested directly only when there
-    is no lookahead (notably for the final training step).
+    Reuse an existing lookahead as a replacement when available. Do not queue
+    another lookahead before preparation: collection and preparation execute
+    on the same serial RolloutManager actor.
     """
     while True:
         try:
@@ -48,7 +50,7 @@ def _prepare_train_data_with_recovery(
             )
         except Exception as error:
             if (
-                getattr(args, "rollout_function_path", None) != _FULLY_ASYNC_ROLLOUT_PATH
+                getattr(args, "rollout_function_path", None) not in _FULLY_ASYNC_ROLLOUT_PATHS
                 or not _is_empty_filtered_batch_error(error)
             ):
                 raise
@@ -63,12 +65,23 @@ def _prepare_train_data_with_recovery(
             rollout_payload = ray.get(rollout_data_next_future)
             rollout_data_next_future = None
 
-            # Keep the normal one-batch lookahead for the next training step.
-            if rollout_id + 1 < args.num_rollout:
-                rollout_data_next_future = request_rollout()
             continue
 
         return rollout_data_ref, rollout_data_next_future
+
+
+def _prepare_then_prefetch(
+    args, rollout_manager, rollout_id, rollout_payload, trainer_weight_version,
+    rollout_data_next_future, request_rollout,
+):
+    """Prepare first, then overlap the next collection with trainer work."""
+    data_ref, next_future = _prepare_train_data_with_recovery(
+        args, rollout_manager, rollout_id, rollout_payload, trainer_weight_version, rollout_data_next_future,
+        request_rollout,
+    )
+    if next_future is None and rollout_id + 1 < args.num_rollout:
+        next_future = request_rollout()
+    return data_ref, next_future
 
 
 def _primary_trainer_perf(results):
@@ -171,12 +184,8 @@ def train(args):
             rollout_data_next_future = None
             logging_utils.drain_offline_wandb_queue(args)
 
-        # Start the next rollout early.
-        if rollout_id + 1 < args.num_rollout:
-            rollout_data_next_future = request_rollout()
-
         trainer_weight_version = actor_model.get_weight_version()
-        rollout_data_curr_ref, rollout_data_next_future = _prepare_train_data_with_recovery(
+        rollout_data_curr_ref, rollout_data_next_future = _prepare_then_prefetch(
             args,
             rollout_manager,
             rollout_id,

@@ -296,9 +296,16 @@ class AsyncRolloutWorker:
                 if now - last_trainer_perf_poll >= 1.0:
                     self._drain_trainer_performance_reports()
                     last_trainer_perf_poll = now
+                queue_snapshot = compute_queue_depth(
+                    groups=groups,
+                    pending_generation=pending_generation,
+                    active_generation=active_generation,
+                    reward_backlog_samples=self.metrics.reward_backlog_samples,
+                    training_queue_samples=self.training_output_queue.sample_count,
+                )
                 self.backpressure.observe_queues(
-                    reward_samples=self.metrics.reward_backlog_samples,
-                    training_samples=self.training_output_queue.sample_count,
+                    reward_samples=queue_snapshot.reward_samples,
+                    training_samples=queue_snapshot.training_samples,
                 )
                 self.backpressure.observe_reward_capacity(
                     saturated=bool(pending_reward)
@@ -339,13 +346,7 @@ class AsyncRolloutWorker:
                         ),
                     )
                     self.pipeline_wandb_monitor.maybe_log(
-                        compute_queue_depth(
-                            groups=groups,
-                            pending_generation=pending_generation,
-                            active_generation=active_generation,
-                            reward_backlog_samples=self.metrics.reward_backlog_samples,
-                            training_queue_samples=self.training_output_queue.sample_count,
-                        ),
+                        queue_snapshot,
                         build_reward_computation_snapshot(
                             active_reward=active_reward,
                             reward_concurrency=self.reward_concurrency,

@@ -1088,6 +1088,7 @@ def _filter_rollout_groups_for_training(
     dropped_reward_timeout_samples = 0
     dropped_survival_groups = 0
     dropped_survival_samples = 0
+    groups_under_2_samples = 0
     original_samples = 0
     kept_samples = 0
 
@@ -1166,11 +1167,14 @@ def _filter_rollout_groups_for_training(
             continue
 
         kept_samples += len(survivors)
+        if len(survivors) < 2:
+            groups_under_2_samples += 1
         kept_groups.append(survivors)
 
     metrics = {
         "original_groups": len(groups),
         "kept_groups": len(kept_groups),
+        "groups_under_2_samples": groups_under_2_samples,
         "dropped_survival_groups": dropped_survival_groups,
         "original_samples": original_samples,
         "kept_samples": kept_samples,

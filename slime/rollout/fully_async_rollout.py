@@ -753,9 +753,23 @@ class AsyncRolloutWorker:
             f"reward_serving_groups={self.metrics.reward_active_groups} "
             f"reward_limit_groups={self.max_reward_groups} "
             f"limit_groups={self.max_reward_backlog_groups} "
+            f"{self._group_generation_histogram(groups)} "
             f"oldest(gid,gen,scheduled,active,rewarded)={oldest} "
             f"newest(gid,gen,scheduled,active,rewarded)={newest}"
         )
+
+    @staticmethod
+    def _group_generation_histogram(groups: dict[int, "GroupState"]) -> str:
+        """``group_size=N group_generated_hist=k:groups;...``: live groups by finished-sample count."""
+        counts: dict[int, int] = {}
+        group_size = 0
+        for group in groups.values():
+            if group.dropped:
+                continue
+            group_size = max(group_size, len(group.samples))
+            counts[group.generated_count] = counts.get(group.generated_count, 0) + 1
+        histogram = ";".join(f"{generated}:{n}" for generated, n in sorted(counts.items())) or "-"
+        return f"group_size={group_size} group_generated_hist={histogram}"
 
     @staticmethod
     def _generated_response_lengths(group: "GroupState") -> list[int]:

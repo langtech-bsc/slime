@@ -123,3 +123,34 @@ def test_prepare_train_data_normal_path_keeps_prefetched_batch(fake_ray_get):
     assert result == ("prepared", "current")
     assert returned_next_future is next_future
     assert manager.collect_calls == []
+
+
+@pytest.mark.parametrize("discard_first", [False, True])
+def test_prepare_finishes_before_next_rollout_is_requested(fake_ray_get, discard_first):
+    events = []
+    results = ([ValueError("No rollout groups survived pre-training filtering"), "replacement"]
+               if discard_first else ["current"])
+    manager = _FakeRolloutManager(results)
+    original_prepare = manager._prepare
+
+    def prepare(*args, **kwargs):
+        events.append("prepare")
+        return original_prepare(*args, **kwargs)
+
+    manager.prepare_train_data = _FakeRemoteMethod(prepare)
+    args = SimpleNamespace(
+        rollout_function_path="reward_functions.rollout_wrapper.generate_rollout_fully_async",
+        num_rollout=2,
+    )
+
+    def request_rollout():
+        events.append("collect")
+        return ("payload", len(manager.prepare_calls))
+
+    result, next_future = train_async._prepare_then_prefetch(
+        args, manager, 0, ("current", 0), 7, None, request_rollout,
+    )
+    assert result == ("prepared", "replacement" if discard_first else "current")
+    assert next_future is not None
+    assert events == (["prepare", "collect", "prepare", "collect"] if discard_first
+                      else ["prepare", "collect"])

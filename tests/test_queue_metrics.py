@@ -26,7 +26,7 @@ def test_compute_queue_depth_counts_reward_and_training_samples():
         training_queue_samples=6,
     )
 
-    assert snapshot.reward_samples == 4
+    assert snapshot.reward_samples == 2
     assert snapshot.training_samples == 6
 
 

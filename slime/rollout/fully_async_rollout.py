@@ -296,9 +296,16 @@ class AsyncRolloutWorker:
                 if now - last_trainer_perf_poll >= 1.0:
                     self._drain_trainer_performance_reports()
                     last_trainer_perf_poll = now
+                queue_snapshot = compute_queue_depth(
+                    groups=groups,
+                    pending_generation=pending_generation,
+                    active_generation=active_generation,
+                    reward_backlog_samples=self.metrics.reward_backlog_samples,
+                    training_queue_samples=self.training_output_queue.sample_count,
+                )
                 self.backpressure.observe_queues(
-                    reward_samples=self.metrics.reward_backlog_samples,
-                    training_samples=self.training_output_queue.sample_count,
+                    reward_samples=queue_snapshot.reward_samples,
+                    training_samples=queue_snapshot.training_samples,
                 )
                 self.backpressure.observe_reward_capacity(
                     saturated=bool(pending_reward)
@@ -339,13 +346,7 @@ class AsyncRolloutWorker:
                         ),
                     )
                     self.pipeline_wandb_monitor.maybe_log(
-                        compute_queue_depth(
-                            groups=groups,
-                            pending_generation=pending_generation,
-                            active_generation=active_generation,
-                            reward_backlog_samples=self.metrics.reward_backlog_samples,
-                            training_queue_samples=self.training_output_queue.sample_count,
-                        ),
+                        queue_snapshot,
                         build_reward_computation_snapshot(
                             active_reward=active_reward,
                             reward_concurrency=self.reward_concurrency,
@@ -752,9 +753,23 @@ class AsyncRolloutWorker:
             f"reward_serving_groups={self.metrics.reward_active_groups} "
             f"reward_limit_groups={self.max_reward_groups} "
             f"limit_groups={self.max_reward_backlog_groups} "
+            f"{self._group_generation_histogram(groups)} "
             f"oldest(gid,gen,scheduled,active,rewarded)={oldest} "
             f"newest(gid,gen,scheduled,active,rewarded)={newest}"
         )
+
+    @staticmethod
+    def _group_generation_histogram(groups: dict[int, "GroupState"]) -> str:
+        """``group_size=N group_generated_hist=k:groups;...``: live groups by finished-sample count."""
+        counts: dict[int, int] = {}
+        group_size = 0
+        for group in groups.values():
+            if group.dropped:
+                continue
+            group_size = max(group_size, len(group.samples))
+            counts[group.generated_count] = counts.get(group.generated_count, 0) + 1
+        histogram = ";".join(f"{generated}:{n}" for generated, n in sorted(counts.items())) or "-"
+        return f"group_size={group_size} group_generated_hist={histogram}"
 
     @staticmethod
     def _generated_response_lengths(group: "GroupState") -> list[int]:

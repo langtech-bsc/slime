@@ -224,6 +224,22 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Example: 'my_module.my_model_provider'."
                 ),
             )
+            # Dense-model YaRN RoPE. Megatron's GPTModel supports
+            # position_embedding_type="yarn", but only the GPT-OSS builder sets
+            # its parameters; there is no CLI path. Setting the scaling factor
+            # switches the model to YaRN with these values (HF rope_parameters).
+            parser.add_argument("--yarn-rotary-scaling-factor", type=float, default=None)
+            parser.add_argument("--yarn-original-max-position-embeddings", type=int, default=None)
+            parser.add_argument("--yarn-beta-fast", type=float, default=32.0)
+            parser.add_argument("--yarn-beta-slow", type=float, default=1.0)
+            parser.add_argument("--yarn-mscale", type=float, default=1.0)
+            parser.add_argument("--yarn-mscale-all-dim", type=float, default=0.0)
+            parser.add_argument(
+                "--yarn-truncate",
+                action=argparse.BooleanOptionalAction,
+                default=True,
+                help="HF rope_parameters.truncate: round the YaRN correction range to integers.",
+            )
             parser.add_argument(
                 "--recompute-loss-function",
                 action="store_true",
@@ -561,6 +577,16 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "It should be able to judge whether the result of a prompt should be selected or not."
                     "We will do dynamic filter for sampling as in DAPO. e.g. not all correct or all wrong samples."
                     "You could use `slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std` as an example."
+                ),
+            )
+            parser.add_argument(
+                "--flat-group-drop-max-frac",
+                type=float,
+                default=None,
+                help=(
+                    "Fully-async rollout only (NeMo-RL drop_flat_groups): drop flat groups (kept rewards "
+                    "spread <= 1e-6, or fewer than 2 kept samples) until int(frac * rollout_batch_size) "
+                    "are dropped in a rollout; later flat groups train. None disables it."
                 ),
             )
 
@@ -1184,6 +1210,36 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 action="store_true",
                 default=False,
                 help="Enable TIS from https://fengyao.notion.site/off-policy-rl for off-policy importance sampling.",
+            )
+            parser.add_argument(
+                "--lr-schedule-step-per-rollout",
+                action="store_true",
+                default=False,
+                help=(
+                    "Advance the LR/WD scheduler once per rollout (by one global batch) instead of once "
+                    "per optimizer step, as NeMo-RL's Megatron worker does: all updates of a rollout use "
+                    "the same LR and --lr-warmup-iters / --lr-decay-iters / --lr-wsd-decay-iters count rollouts."
+                ),
+            )
+            parser.add_argument(
+                "--seq-logprob-error-threshold",
+                type=float,
+                default=None,
+                help=(
+                    "NeMo-RL seq_logprob_error_threshold: drop from the loss (and from the advantage "
+                    "whitening) every sequence whose mean exp(|train_logprob - rollout_logprob|) over "
+                    "its loss tokens exceeds this value."
+                ),
+            )
+            parser.add_argument(
+                "--loss-normalizer",
+                choices=["all_rollouts", "valid_rollouts"],
+                default="all_rollouts",
+                help=(
+                    "Divisor of the per-rollout-mean loss: every rollout of the step (default) or only "
+                    "rollouts with at least one loss token, summed over DP (NeMo-RL sum(sample_mask)). "
+                    "The LR scheduler always counts all rollouts."
+                ),
             )
             parser.add_argument(
                 "--tis-clip",

@@ -36,6 +36,7 @@ from .hf_checkpoint_saver import save_hf_model_to_path
 from .initialize import init, is_megatron_main_rank
 from .loss import compute_advantages_and_returns, get_log_probs_and_entropy, get_values
 from .model import forward_only, initialize_model_and_optimizer, save, train
+from .nemo_parity import mask_high_logprob_error_sequences, valid_rollout_counts_per_step
 from .update_weight.common import named_params_and_buffers
 from .update_weight.update_weight_from_disk import UpdateWeightFromDisk
 from .update_weight.update_weight_from_distributed import UpdateWeightFromDistributed
@@ -578,9 +579,14 @@ class MegatronTrainRayActor(TrainRayActor):
                 if self._active_model_tag != "actor":
                     self._switch_model("actor")
 
+                # NeMo-RL seq_logprob_error_threshold: out of the loss and of the whitening stats.
+                parity_metrics = mask_high_logprob_error_sequences(self.args, rollout_data)
+
                 # Calculate adv and returns. Need to performed before training (instead of on the fly),
                 # because we may need normalize the whole rollout.
                 compute_advantages_and_returns(self.args, rollout_data)
+                if parity_metrics and mpu.get_tensor_model_parallel_rank() == 0:
+                    logger.info("rollout %s nemo parity: %s", rollout_id, parity_metrics)
 
             if self.rollout_data_postprocess is not None:
                 self.rollout_data_postprocess(self.args, rollout_id, rollout_data)
@@ -616,6 +622,9 @@ class MegatronTrainRayActor(TrainRayActor):
             # Anything before this point (log-prob passes) is reported as its own phase.
             _thc_probe("pre_actor_train", rollout_id, rollout_data, num_microbatches)
             with timer("actor_train"):
+                loss_denominators = None
+                if self.args.loss_normalizer == "valid_rollouts" and mpu.is_pipeline_last_stage():
+                    loss_denominators = valid_rollout_counts_per_step(rollout_data, num_microbatches)
                 train(
                     rollout_id,
                     self.model,
@@ -624,6 +633,7 @@ class MegatronTrainRayActor(TrainRayActor):
                     data_iterator,
                     num_microbatches,
                     global_batch_sizes,
+                    loss_denominators=loss_denominators,
                 )
             _thc_probe("actor_train", rollout_id, rollout_data, num_microbatches)
 

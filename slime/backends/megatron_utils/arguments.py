@@ -140,8 +140,41 @@ def _hf_validate_args(args, hf_config):
                 f"rotary_base {getattr(args, 'rotary_base', None)}, please check the config."
             )
 
+    errors.extend(_yarn_validation_errors(args, hf_config))
+
     if len(errors) > 0:
         raise AssertionError("hf_validate_args failed: " + "; ".join(errors))
+
+
+def _yarn_validation_errors(args, hf_config) -> list[str]:
+    """A YaRN checkpoint must run with matching --yarn-* args, and vice versa.
+
+    Without this a YaRN model would silently train with plain RoPE.
+    """
+    rope = getattr(hf_config, "rope_parameters", None) or getattr(hf_config, "rope_scaling", None) or {}
+    rope_type = rope.get("rope_type", rope.get("type")) if isinstance(rope, dict) else None
+    factor = getattr(args, "yarn_rotary_scaling_factor", None)
+    if rope_type != "yarn":
+        if factor is not None:
+            return [f"--yarn-rotary-scaling-factor {factor} set but the hf config rope type is {rope_type!r}"]
+        return []
+    if factor is None:
+        return ["hf config uses YaRN RoPE but --yarn-rotary-scaling-factor is not set"]
+    errors = []
+    for key, arg_name, default in [
+        ("factor", "yarn_rotary_scaling_factor", None),
+        ("original_max_position_embeddings", "yarn_original_max_position_embeddings", None),
+        ("beta_fast", "yarn_beta_fast", 32.0),
+        ("beta_slow", "yarn_beta_slow", 1.0),
+        ("truncate", "yarn_truncate", True),
+    ]:
+        hf_value = rope.get(key, default)
+        if hf_value is not None and hf_value != getattr(args, arg_name):
+            errors.append(f"rope {key} in hf config {hf_value} is not equal to {arg_name} {getattr(args, arg_name)}")
+    for key in ("mscale", "mscale_all_dim", "attention_factor"):
+        if rope.get(key) is not None:
+            errors.append(f"hf YaRN {key}={rope[key]} is not supported by the dense YaRN path")
+    return errors
 
 
 def _set_default_megatron_args(args):

@@ -55,6 +55,36 @@ class LinearForLastLayer(torch.nn.Linear):
         return logits, None
 
 
+def _apply_dense_yarn(args, config: TransformerConfig) -> str:
+    """Switch a dense GPT model to YaRN RoPE when --yarn-rotary-scaling-factor is set.
+
+    Sets the yarn_* attributes GPTModel and attention read from the config (as the
+    GPT-OSS builder does) and returns the position embedding type for GPTModel.
+    The attention applies the YaRN concentration factor (HF attention_factor) to
+    q and k through apply_rotary_pos_emb(mscale=...); TE's fused RoPE drops it
+    without a warning on packed (thd) sequences, so rope fusion must be off.
+    """
+    if args.yarn_rotary_scaling_factor is None:
+        return args.position_embedding_type
+    assert args.position_embedding_type == "rope", (
+        f"--yarn-rotary-scaling-factor needs --position-embedding-type rope, got {args.position_embedding_type}"
+    )
+    assert args.yarn_original_max_position_embeddings, "--yarn-original-max-position-embeddings is required"
+    assert not args.use_rope_scaling, "--use-rope-scaling (llama3) and YaRN are exclusive"
+    assert not config.apply_rope_fusion, (
+        "YaRN needs --no-rope-fusion: the fused thd RoPE kernel ignores the YaRN mscale"
+    )
+    config.position_embedding_type = "yarn"
+    config.yarn_rotary_scaling_factor = args.yarn_rotary_scaling_factor
+    config.yarn_original_max_position_embeddings = args.yarn_original_max_position_embeddings
+    config.yarn_beta_fast = args.yarn_beta_fast
+    config.yarn_beta_slow = args.yarn_beta_slow
+    config.yarn_mscale = args.yarn_mscale
+    config.yarn_mscale_all_dim = args.yarn_mscale_all_dim
+    config.yarn_correction_range_round_to_int = args.yarn_truncate
+    return "yarn"
+
+
 def _get_model_provider_func(
     args: argparse.Namespace,
     role: Literal["actor", "critic"] = "actor",
@@ -136,6 +166,7 @@ def _get_model_provider_func(
 
         # Experimental loading arguments from yaml
         config: TransformerConfig = core_transformer_config_from_args(args)
+        position_embedding_type = _apply_dense_yarn(args, config)
 
         if args.spec is not None:
             transformer_layer_spec = import_module(args.spec)
@@ -207,7 +238,7 @@ def _get_model_provider_func(
             "fp16_lm_cross_entropy": args.fp16_lm_cross_entropy,
             "parallel_output": True,
             "share_embeddings_and_output_weights": not args.untie_embeddings_and_output_weights,
-            "position_embedding_type": args.position_embedding_type,
+            "position_embedding_type": position_embedding_type,
             "rotary_percent": args.rotary_percent,
             "rotary_base": args.rotary_base,
             "rope_scaling": args.use_rope_scaling,

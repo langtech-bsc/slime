@@ -900,12 +900,21 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> Rollout
     last_log = started
     LOG_EVERY = 30.0
 
+    # NeMo-RL drop_flat_groups: drop up to ``max_frac * target`` flat groups per
+    # rollout (zero advantage, no signal) and keep collecting; later flat groups train.
+    flat_max_frac = getattr(args, "flat_group_drop_max_frac", None)
+    flat_drop_budget = int(flat_max_frac * target) if flat_max_frac is not None else 0
+    flat_dropped = 0
+
     while len(collected) < target:
         # Pull whatever's done.
         drained = 0
         for gid, group in worker.get_completed_groups():
-            collected[gid] = group
             drained += 1
+            if flat_dropped < flat_drop_budget and is_flat_group(args, group):
+                flat_dropped += 1
+                continue
+            collected[gid] = group
 
         if not drained:
             await asyncio.sleep(0.05)
@@ -933,7 +942,11 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> Rollout
         time.time() - started,
         worker.queue_size(),
     )
-    return RolloutFnTrainOutput(samples=out, metrics=worker.collect_metrics())
+    metrics = worker.collect_metrics()
+    if flat_max_frac is not None:
+        metrics["rollout/flat_groups_dropped"] = flat_dropped
+        logger.info("fully-async rollout %d: dropped %d flat groups (budget %d)", rollout_id, flat_dropped, flat_drop_budget)
+    return RolloutFnTrainOutput(samples=out, metrics=metrics)
 
 
 def generate_rollout_fully_async(args, rollout_id, data_buffer, evaluation: bool = False):
@@ -995,6 +1008,23 @@ class FullyAsyncMetrics:
             "fully_async/generated_samples": self.generated_samples,
             "fully_async/rewarded_samples": self.rewarded_samples,
         }
+
+
+def is_flat_group(args, group: list[Sample | list[Sample]], tol: float = 1e-6) -> bool:
+    """NeMo-RL flat group: fewer than 2 kept attempts, or kept rewards spread <= tol.
+
+    Attempts with ``remove_sample`` (dropped from the loss) do not count. A
+    multi-segment attempt is scored by its first segment, as in the publisher.
+    """
+    rewards = []
+    for unit in group:
+        sample = unit[0] if isinstance(unit, list) else unit
+        if sample.remove_sample:
+            continue
+        rewards.append(float(sample.get_reward_value(args)))
+    if len(rewards) < 2:
+        return True
+    return max(rewards) - min(rewards) <= tol
 
 
 def _contains_aborted(sample_or_group: Sample | list[Sample]) -> bool:

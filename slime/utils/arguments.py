@@ -17,6 +17,26 @@ from slime.utils.logging_utils import configure_logger
 logger = logging.getLogger(__name__)
 
 
+
+def add_yarn_arguments(parser):
+    """Dense-model YaRN RoPE. Megatron's GPTModel supports position_embedding_type="yarn",
+    but only the GPT-OSS builder sets its parameters; there is no CLI path. Setting the
+    scaling factor switches the model to YaRN with these values (HF rope_parameters).
+    Shared with tools/convert_hf_to_torch_dist.py, which builds the same model."""
+    parser.add_argument("--yarn-rotary-scaling-factor", type=float, default=None)
+    parser.add_argument("--yarn-original-max-position-embeddings", type=int, default=None)
+    parser.add_argument("--yarn-beta-fast", type=float, default=32.0)
+    parser.add_argument("--yarn-beta-slow", type=float, default=1.0)
+    parser.add_argument("--yarn-mscale", type=float, default=1.0)
+    parser.add_argument("--yarn-mscale-all-dim", type=float, default=0.0)
+    parser.add_argument(
+        "--yarn-truncate",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="HF rope_parameters.truncate: round the YaRN correction range to integers.",
+    )
+    return parser
+
 def reset_arg(parser, name, **kwargs):
     """
     Reset the default value of a Megatron argument.
@@ -224,22 +244,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Example: 'my_module.my_model_provider'."
                 ),
             )
-            # Dense-model YaRN RoPE. Megatron's GPTModel supports
-            # position_embedding_type="yarn", but only the GPT-OSS builder sets
-            # its parameters; there is no CLI path. Setting the scaling factor
-            # switches the model to YaRN with these values (HF rope_parameters).
-            parser.add_argument("--yarn-rotary-scaling-factor", type=float, default=None)
-            parser.add_argument("--yarn-original-max-position-embeddings", type=int, default=None)
-            parser.add_argument("--yarn-beta-fast", type=float, default=32.0)
-            parser.add_argument("--yarn-beta-slow", type=float, default=1.0)
-            parser.add_argument("--yarn-mscale", type=float, default=1.0)
-            parser.add_argument("--yarn-mscale-all-dim", type=float, default=0.0)
-            parser.add_argument(
-                "--yarn-truncate",
-                action=argparse.BooleanOptionalAction,
-                default=True,
-                help="HF rope_parameters.truncate: round the YaRN correction range to integers.",
-            )
+            add_yarn_arguments(parser)
             parser.add_argument(
                 "--recompute-loss-function",
                 action="store_true",

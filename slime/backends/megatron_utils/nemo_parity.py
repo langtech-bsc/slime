@@ -6,6 +6,9 @@
   tokens set to 0) before the advantages are whitened, so it is also out of
   the whitening statistics. It still counted in its group baseline, which the
   rollout side computed earlier.
+* ``gen_kl_k3_sums``: NeMo's ``gen_kl_error`` metric, k3 estimate of KL(P_gen || P_train)
+  per token, ``exp(r) - 1 - r`` with ``r = train_lp - rollout_lp`` (no clamping), averaged
+  over every loss token of the step (token-weighted, not per sample).
 * ``valid_rollout_counts_per_step``: NeMo divides the sequence-mean loss by the
   number of sequences that still have a loss token (``sum(sample_mask)``,
   summed over DP), not by the nominal batch size. The LR scheduler keeps the
@@ -47,6 +50,27 @@ def sequence_logprob_errors(
     return errors
 
 
+def gen_kl_k3_sums(
+    log_probs: Sequence[torch.Tensor],
+    rollout_log_probs: Sequence[torch.Tensor],
+    loss_masks: Sequence[torch.Tensor],
+) -> tuple[float, float]:
+    """``(sum_t k3 * mask, sum_t mask)`` over full responses, as NeMo's ``gen_kl_error``.
+
+    NeMo: ``calculate_kl(logprobs=generation_logprobs, logprobs_reference=prev_logprobs,
+    kl_type="k3", no clamps)`` -> ``logr = prev - gen``, ``exp(logr) - 1 - logr``, then
+    ``masked_mean`` with the global valid-token count.
+    """
+    num = 0.0
+    den = 0.0
+    for lp, rlp, mask in zip(log_probs, rollout_log_probs, loss_masks, strict=True):
+        mask = mask.to(device=lp.device, dtype=torch.float32)
+        logr = lp.float() - rlp.to(lp.device).float()
+        num += float(((torch.exp(logr) - 1 - logr) * mask).sum())
+        den += float(mask.sum())
+    return num, den
+
+
 def mask_high_logprob_error_sequences(args: Any, rollout_data: dict[str, Any]) -> dict[str, float]:
     """Zero the loss mask of sequences above ``args.seq_logprob_error_threshold``.
 
@@ -77,9 +101,17 @@ def mask_high_logprob_error_sequences(args: Any, rollout_data: dict[str, Any]) -
             masked += 1
     if masked:
         _recompute_rollout_mask_sums(rollout_data)
+    # After the masking: NeMo's mask is token_mask * sample_mask.
+    kl_num, kl_den = gen_kl_k3_sums(full_lp, full_rlp, loss_masks)
+    if dist.is_initialized():
+        # CP ranks hold the same full responses: reduce over DP only.
+        t = torch.tensor([kl_num, kl_den], dtype=torch.float64, device=torch.cuda.current_device())
+        dist.all_reduce(t, group=mpu.get_data_parallel_group())
+        kl_num, kl_den = (float(x) for x in t.tolist())
     return {
         "nemo_parity/seq_logprob_error_masked": float(masked),
         "nemo_parity/seq_logprob_error_max": max(errors, default=0.0),
+        "nemo_parity/gen_kl_error": kl_num / (kl_den + 1e-8),
     }
 
 

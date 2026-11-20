@@ -310,6 +310,61 @@ def test_fully_async_requeued_aborted_group_preserves_trajectory_for_resume(monk
 
 
 @pytest.mark.unit
+def test_fully_async_aborted_group_waits_for_siblings_and_keeps_finished_samples(monkeypatch):
+    """An abort requeues the group only after every sibling is back, and resumes only the
+    aborted samples: a finished one generating again continued past its stop token (2026-11-20:
+    25-32% of samples had <|im_end|> mid-response), and requeueing at the first abort shared
+    Sample objects with in-flight generations (responses past rollout_max_response_len)."""
+    from collections import deque
+
+    from slime.rollout import fully_async_rollout
+
+    monkeypatch.setattr(fully_async_rollout, "GenerateState", _FakeGenerateState)
+
+    data_source = _FiniteDataSource(groups=0, group_size=3)
+    worker = AsyncRolloutWorker(
+        _args(rollout_max_response_len=10, rollout_max_context_len=16),
+        data_source,
+        generation_concurrency=1,
+        reward_concurrency=1,
+        max_reward_backlog_groups=8,
+        max_inference_groups=99,
+        max_reward_groups=99,
+    )
+    finished, aborted, in_flight = (Sample(index=i, prompt="p") for i in (1, 2, 3))
+    finished.status = Sample.Status.COMPLETED
+    finished.reward = 0.5
+    aborted.status = Sample.Status.ABORTED
+    group = GroupState(gid=1, samples=[finished, aborted, in_flight])
+    groups = {1: group}
+    pending_reward = deque()
+
+    async def ret(s):
+        return s
+
+    async def run_case():
+        for idx, s in ((0, finished), (1, aborted)):
+            task = asyncio.create_task(ret(s))
+            await task
+            await worker._handle_generation_done(task, 1, idx, groups, pending_reward)
+        # the in-flight sibling is not back yet: nothing requeued, its Sample not shared
+        assert data_source.requeued == [] and 1 in groups
+        in_flight.status = Sample.Status.ABORTED
+        task = asyncio.create_task(ret(in_flight))
+        await task
+        await worker._handle_generation_done(task, 1, 2, groups, pending_reward)
+
+    asyncio.run(run_case())
+
+    assert groups == {}
+    assert data_source.requeued == [[finished, aborted, in_flight]]
+    assert finished.status == Sample.Status.COMPLETED and finished.reward is None
+    assert aborted.status == Sample.Status.PENDING and in_flight.status == Sample.Status.PENDING
+    # only the sample that finished before the abort was handed to the reward stage
+    assert [item[1] for item in pending_reward] == [0]
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize("empty_trajectory", [False, True])
 def test_fully_async_drops_invalid_generated_unit_before_reward(monkeypatch, empty_trajectory):
     from collections import deque

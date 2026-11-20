@@ -500,10 +500,22 @@ class AsyncRolloutWorker:
             getattr(sample, "response_length", 0) or 0 for sample in _iter_samples(generated)
         )
         self.backpressure.record_generated(generated_count)
-        if _contains_aborted(generated):
+        if group.aborted or _contains_aborted(generated):
+            # Requeue only once every sample of the group is back: requeueing at the first
+            # aborted sample shared the Sample objects with sibling generations still in
+            # flight, which kept appending to them (responses past rollout_max_response_len).
+            group.aborted = True
+            if group.generated_count < len(group.samples):
+                return
             group.dropped = True
             for sample in group.samples:
-                sample.mark_pending_for_trajectory_resume()
+                if sample.status == Sample.Status.ABORTED:
+                    sample.mark_pending_for_trajectory_resume()
+                else:
+                    # Finished before the abort: keep the trajectory (generating again would
+                    # continue past its stop token); it is scored again when the group returns.
+                    sample.reward = None
+                    sample.remove_sample = False
             try:
                 self.data_buffer.add_samples([group.samples])
             except Exception:  # noqa: BLE001
@@ -968,6 +980,7 @@ class GroupState:
     active_reward_count: int = 0
     rewarded_count: int = 0
     dropped: bool = False
+    aborted: bool = False
 
     def __post_init__(self) -> None:
         self.generated_units = [None] * len(self.samples)

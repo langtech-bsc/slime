@@ -103,9 +103,10 @@ def mask_high_logprob_error_sequences(args: Any, rollout_data: dict[str, Any]) -
         _recompute_rollout_mask_sums(rollout_data)
     # After the masking: NeMo's mask is token_mask * sample_mask.
     kl_num, kl_den = gen_kl_k3_sums(full_lp, full_rlp, loss_masks)
-    if dist.is_initialized():
+    if dist.is_initialized() and mpu.model_parallel_is_initialized():
         # CP ranks hold the same full responses: reduce over DP only.
-        t = torch.tensor([kl_num, kl_den], dtype=torch.float64, device=torch.cuda.current_device())
+        device = full_lp[0].device if full_lp else torch.device("cpu")
+        t = torch.tensor([kl_num, kl_den], dtype=torch.float64, device=device)
         dist.all_reduce(t, group=mpu.get_data_parallel_group())
         kl_num, kl_den = (float(x) for x in t.tolist())
     return {

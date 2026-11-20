@@ -749,3 +749,83 @@ def test_fully_async_reward_group_cap_blocks_new_group(monkeypatch):
 
     asyncio.run(run_case())
     assert max_reward_groups_seen <= 2
+
+
+def _versioned_group(start_version, size=2, reward=None):
+    group = []
+    for i in range(size):
+        sample = Sample(index=i, prompt="p")
+        sample.weight_versions = [str(start_version), str(start_version + 1)]
+        sample.reward = float(i) if reward is None else reward
+        sample.status = Sample.Status.COMPLETED
+        group.append(sample)
+    return group
+
+
+@pytest.mark.unit
+def test_group_age_helpers_follow_nemo_replay_buffer():
+    from types import SimpleNamespace
+
+    from slime.rollout.fully_async_rollout import (
+        group_age_target_version,
+        group_start_weight_version,
+        group_too_old,
+    )
+
+    args = SimpleNamespace(group_max_age_steps=2)
+    # no prepare_train_data yet: the first rollout cannot hold old groups
+    assert group_age_target_version(args, 0) is None
+    args.group_age_trainer_version_offset = 1
+    assert group_age_target_version(args, 3) == 4
+    group = _versioned_group(2)
+    group[1].weight_versions = ["1", "2"]  # a resumed sample started earlier: the group is that old
+    assert group_start_weight_version(group) == 1
+    # NeMo: valid iff target - start <= max_age (start = version the generation began with)
+    assert group_too_old(args, group, 4)
+    assert not group_too_old(args, group, 3)
+    assert not group_too_old(args, _versioned_group(2), 4)
+    assert not group_too_old(args, group, None)
+    with pytest.raises(ValueError):
+        group_age_target_version(SimpleNamespace(group_max_age_steps=2, update_weights_interval=2), 1)
+    assert group_age_target_version(SimpleNamespace(group_max_age_steps=None), 1) is None
+
+
+@pytest.mark.unit
+def test_collector_replaces_too_old_groups_to_fill_the_step(monkeypatch):
+    """Old groups are dropped whole and collection goes on until the step has its groups;
+    flat groups are checked first and count against the flat budget (NeMo order)."""
+    from types import SimpleNamespace
+
+    from slime.rollout import fully_async_rollout
+
+    batches = [
+        [(1, _versioned_group(1)), (2, _versioned_group(3))],  # gid 1 too old for target 4
+        [(3, _versioned_group(1, reward=1.0)), (4, _versioned_group(2))],  # gid 3 old and flat
+        [(5, _versioned_group(4))],
+    ]
+
+    class _Worker:
+        def get_completed_groups(self):
+            return batches.pop(0) if batches else []
+
+        def queue_size(self):
+            return 0
+
+        def collect_metrics(self):
+            return {}
+
+    monkeypatch.setattr(fully_async_rollout, "_get_global_worker", lambda args, data_buffer: _Worker())
+    args = SimpleNamespace(
+        rollout_global_dataset=True,
+        rollout_batch_size=3,
+        group_max_age_steps=2,
+        group_age_trainer_version_offset=1,
+        flat_group_drop_max_frac=0.5,
+        reward_key=None,
+    )
+    out = asyncio.run(fully_async_rollout._generate_rollout_async(args, 3, data_buffer=None))
+
+    kept_starts = sorted(fully_async_rollout.group_start_weight_version(g) for g in out.samples)
+    assert kept_starts == [2, 3, 4]
+    assert out.metrics["rollout/stale_groups_dropped"] == 1
+    assert out.metrics["rollout/flat_groups_dropped"] == 1

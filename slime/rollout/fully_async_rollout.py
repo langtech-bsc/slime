@@ -917,14 +917,23 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> Rollout
     flat_max_frac = getattr(args, "flat_group_drop_max_frac", None)
     flat_drop_budget = int(flat_max_frac * target) if flat_max_frac is not None else 0
     flat_dropped = 0
+    # NeMo-RL max_trajectory_age_steps: groups too old for this rollout's training step are
+    # dropped whole and collection goes on, so the step still gets ``target`` groups.
+    target_version = group_age_target_version(args, rollout_id)
+    stale_dropped = 0
 
     while len(collected) < target:
         # Pull whatever's done.
         drained = 0
         for gid, group in worker.get_completed_groups():
             drained += 1
+            # NeMo drops flat groups when they are generated and old ones when the step samples
+            # its buffer, so a group that is both counts against the flat budget.
             if flat_dropped < flat_drop_budget and is_flat_group(args, group):
                 flat_dropped += 1
+                continue
+            if group_too_old(args, group, target_version):
+                stale_dropped += 1
                 continue
             collected[gid] = group
 
@@ -955,6 +964,15 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> Rollout
         worker.queue_size(),
     )
     metrics = worker.collect_metrics()
+    if target_version is not None:
+        metrics["rollout/stale_groups_dropped"] = stale_dropped
+        logger.info(
+            "fully-async rollout %d: dropped %d groups older than %d steps (target trainer version %d)",
+            rollout_id,
+            stale_dropped,
+            args.group_max_age_steps,
+            target_version,
+        )
     if flat_max_frac is not None:
         metrics["rollout/flat_groups_dropped"] = flat_dropped
         logger.info("fully-async rollout %d: dropped %d flat groups (budget %d)", rollout_id, flat_dropped, flat_drop_budget)
@@ -1021,6 +1039,41 @@ class FullyAsyncMetrics:
             "fully_async/generated_samples": self.generated_samples,
             "fully_async/rewarded_samples": self.rewarded_samples,
         }
+
+
+def group_age_target_version(args, rollout_id: int) -> int | None:
+    """Trainer weight version rollout ``rollout_id`` will be trained with (``--group-max-age-steps``).
+
+    ``None`` until the first ``prepare_train_data`` records the offset (the first rollout is
+    generated with the initial weights, so nothing in it can be too old).
+    """
+    if getattr(args, "group_max_age_steps", None) is None:
+        return None
+    if getattr(args, "update_weights_interval", 1) != 1:
+        raise ValueError("--group-max-age-steps needs one weight update per rollout (update_weights_interval=1)")
+    offset = getattr(args, "group_age_trainer_version_offset", None)
+    return None if offset is None else int(offset) + int(rollout_id)
+
+
+def group_start_weight_version(group: list[Sample | list[Sample]]) -> int | None:
+    """Oldest weight version any sample of the group started generating with (NeMo's group version)."""
+    versions = []
+    for unit in group:
+        for sample in _iter_samples(unit):
+            if sample.weight_versions:
+                try:
+                    versions.append(int(sample.weight_versions[0]))
+                except (TypeError, ValueError):
+                    continue
+    return min(versions) if versions else None
+
+
+def group_too_old(args, group: list[Sample | list[Sample]], target_version: int | None) -> bool:
+    """NeMo ReplayBuffer validity: ``target_version - start_version > max_age`` means too old."""
+    if target_version is None:
+        return False
+    start = group_start_weight_version(group)
+    return start is not None and target_version - start > args.group_max_age_steps
 
 
 def is_flat_group(args, group: list[Sample | list[Sample]], tol: float = 1e-6) -> bool:

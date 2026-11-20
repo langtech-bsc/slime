@@ -178,6 +178,14 @@ def build_dp_schedule(
         step_specs = [
             (i * global_batch_size, (i + 1) * global_batch_size, global_batch_size) for i in range(num_full_steps)
         ]
+        remainder = num_rollouts - num_full_steps * global_batch_size
+        # --train-partial-last-step: train the leftover rollouts as a smaller last step (needs
+        # at least one sample per DP rank) instead of dropping them.
+        if remainder and getattr(args, "train_partial_last_step", False):
+            start = num_full_steps * global_batch_size
+            remainder_samples = sum(len(rollout_id_to_samples[rid]) for rid in rollout_ids[start:])
+            if remainder_samples >= dp_size:
+                step_specs.append((start, num_rollouts, remainder))
 
     partitions: list[list[int]] = [[] for _ in range(dp_size)]
     micro_batch_indices: list[list[list[int]]] = [[] for _ in range(dp_size)]

@@ -594,6 +594,27 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "are dropped in a rollout; later flat groups train. None disables it."
                 ),
             )
+            parser.add_argument(
+                "--group-max-age-steps",
+                type=int,
+                default=None,
+                help=(
+                    "Fully-async rollout only (NeMo-RL async_grpo.max_trajectory_age_steps): a group is "
+                    "used only if trainer_weight_version - (weight version its generation started with) "
+                    "<= this, judged when the rollout is collected for its training step; older groups "
+                    "are dropped whole and collection continues until rollout_batch_size valid groups. "
+                    "Needs one weight update per rollout. None disables it."
+                ),
+            )
+            parser.add_argument(
+                "--train-partial-last-step",
+                action="store_true",
+                default=False,
+                help=(
+                    "Train the rollouts left after the full global batches as one smaller last step "
+                    "instead of dropping them (default: dropped)."
+                ),
+            )
 
             # partial rollout
             parser.add_argument(

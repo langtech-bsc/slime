@@ -53,6 +53,7 @@ from slime.utils.timer import Timer, timer
 
 from ..sglang import DeltaEncoding, DeltaParam, DeltaSpec
 from .update_weight_from_distributed import UpdateWeightFromDistributed
+from .pause_mode import flush_cache_after_pause
 
 logger = logging.getLogger(__name__)
 
@@ -586,7 +587,8 @@ class UpdateWeightFromDistributedDelta(UpdateWeightFromDistributed):
 
         if dist.get_rank() == 0:
             ray.get([engine.pause_generation.remote() for engine in self.rollout_engines])
-            ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
+            if flush_cache_after_pause(self.args):
+                ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
         dist.barrier(group=get_gloo_group())
 
         self.density_nnz = self.density_numel = self.wire_bytes = self._flush_idx = 0

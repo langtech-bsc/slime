@@ -829,3 +829,31 @@ def test_collector_replaces_too_old_groups_to_fill_the_step(monkeypatch):
     assert kept_starts == [2, 3, 4]
     assert out.metrics["rollout/stale_groups_dropped"] == 1
     assert out.metrics["rollout/flat_groups_dropped"] == 1
+
+
+@pytest.mark.unit
+def test_dispatch_weight_version_stamp_is_the_group_version():
+    """in_place pause: SGLang reports the version a request ended with, so the dispatch stamp
+    (first one kept across resumes) is the group's NeMo generation_weight_version."""
+    from types import SimpleNamespace
+
+    from slime.rollout.fully_async_rollout import (
+        _weight_version_url,
+        group_start_weight_version,
+        stamp_dispatch_weight_version,
+    )
+
+    group = _versioned_group(5)  # weight_versions ["5", "6"]: what SGLang reported at the end
+    stamp_dispatch_weight_version(group[0], "3")
+    stamp_dispatch_weight_version(group[0], "4")  # a resume does not overwrite the first stamp
+    stamp_dispatch_weight_version(group[1], None)  # unknown version: falls back to weight_versions
+    assert group[0].metadata["dispatch_weight_version"] == "3"
+    assert group_start_weight_version(group) == 3
+    group[1].metadata = None
+    stamp_dispatch_weight_version(group[1], "4")
+    assert group[1].metadata == {"dispatch_weight_version": "4"}
+
+    args = SimpleNamespace(rollout_external_engine_infos=[{"url": "http://10.0.0.1:31000/"}])
+    assert _weight_version_url(args) == "http://10.0.0.1:31000/get_weight_version"
+    args = SimpleNamespace(rollout_external_engine_infos=None, sglang_router_ip="r", sglang_router_port=9)
+    assert _weight_version_url(args) == "http://r:9/get_weight_version"

@@ -595,6 +595,18 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--sglang-pause-generation-mode",
+                choices=["abort", "retract", "in_place"],
+                default="abort",
+                help=(
+                    "SGLang pause_generation mode around weight updates. abort (default): running "
+                    "requests are aborted and resumed later, the cache is flushed. in_place: requests "
+                    "stay in the engine and continue with their KV cache after the update (NeMo-RL "
+                    "in_flight_weight_updates with recompute_kv_cache_after_weight_updates false); "
+                    "the cache is not flushed (SGLang refuses with requests running)."
+                ),
+            )
+            parser.add_argument(
                 "--group-max-age-steps",
                 type=int,
                 default=None,

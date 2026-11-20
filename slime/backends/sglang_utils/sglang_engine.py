@@ -493,7 +493,9 @@ class SGLangEngine(RayActor):
         )
 
     def pause_generation(self):
-        response = requests.post(f"http://{self.server_host}:{self.server_port}/pause_generation", json={})
+        mode = getattr(self.args, "sglang_pause_generation_mode", "abort")
+        payload = {} if mode == "abort" else {"mode": mode}
+        response = requests.post(f"http://{self.server_host}:{self.server_port}/pause_generation", json=payload)
         response.raise_for_status()
         return response
 

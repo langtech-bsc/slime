@@ -973,8 +973,8 @@ def train(
         step_start_microbatch += step_num_microbatches
     microbatch_pbar.close()
     if args.lr_schedule_step_per_rollout:
-        # NeMo-RL steps its Megatron scheduler once per train() call: every update of the
-        # rollout uses the same LR, and --lr-*-iters count rollouts (one global batch each).
+        # One scheduler step per train() call: every update of the rollout uses the same LR,
+        # and --lr-*-iters count rollouts (one global batch each).
         opt_param_scheduler.step(increment=args.global_batch_size)
     # Close out pre-hooks if using distributed optimizer and overlapped param gather.
     if pre_hook_enabled:

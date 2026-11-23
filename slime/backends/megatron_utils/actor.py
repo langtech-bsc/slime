@@ -36,7 +36,7 @@ from .hf_checkpoint_saver import save_hf_model_to_path
 from .initialize import init, is_megatron_main_rank
 from .loss import compute_advantages_and_returns, get_log_probs_and_entropy, get_values
 from .model import forward_only, initialize_model_and_optimizer, save, train
-from .nemo_parity import mask_high_logprob_error_sequences, valid_rollout_counts_per_step
+from .loss_normalizer import valid_rollout_counts_per_step
 from .update_weight.common import named_params_and_buffers
 from .update_weight.update_weight_from_disk import UpdateWeightFromDisk
 from .update_weight.update_weight_from_distributed import UpdateWeightFromDistributed
@@ -207,6 +207,12 @@ class MegatronTrainRayActor(TrainRayActor):
             from slime.utils.misc import load_function
 
             self.rollout_data_postprocess = load_function(self.args.rollout_data_postprocess_path)
+
+        self.pre_advantage_hook = None
+        if self.args.pre_advantage_hook_path is not None:
+            from slime.utils.misc import load_function
+
+            self.pre_advantage_hook = load_function(self.args.pre_advantage_hook_path)
 
         self.prof.on_init_end()
 
@@ -579,14 +585,13 @@ class MegatronTrainRayActor(TrainRayActor):
                 if self._active_model_tag != "actor":
                     self._switch_model("actor")
 
-                # NeMo-RL seq_logprob_error_threshold: out of the loss and of the whitening stats.
-                parity_metrics = mask_high_logprob_error_sequences(self.args, rollout_data)
+                # Loss-mask edits made here also leave the advantage whitening statistics.
+                if self.pre_advantage_hook is not None:
+                    self.pre_advantage_hook(self.args, rollout_id, rollout_data)
 
                 # Calculate adv and returns. Need to performed before training (instead of on the fly),
                 # because we may need normalize the whole rollout.
                 compute_advantages_and_returns(self.args, rollout_data)
-                if parity_metrics and mpu.get_tensor_model_parallel_rank() == 0:
-                    logger.info("rollout %s nemo parity: %s", rollout_id, parity_metrics)
 
             if self.rollout_data_postprocess is not None:
                 self.rollout_data_postprocess(self.args, rollout_id, rollout_data)

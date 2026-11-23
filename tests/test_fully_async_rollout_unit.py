@@ -763,7 +763,7 @@ def _versioned_group(start_version, size=2, reward=None):
 
 
 @pytest.mark.unit
-def test_group_age_helpers_follow_nemo_replay_buffer():
+def test_group_age_helpers():
     from types import SimpleNamespace
 
     from slime.rollout.fully_async_rollout import (
@@ -780,7 +780,7 @@ def test_group_age_helpers_follow_nemo_replay_buffer():
     group = _versioned_group(2)
     group[1].weight_versions = ["1", "2"]  # a resumed sample started earlier: the group is that old
     assert group_start_weight_version(group) == 1
-    # NeMo: valid iff target - start <= max_age (start = version the generation began with)
+    # valid iff target - start <= max_age (start = version the generation began with)
     assert group_too_old(args, group, 4)
     assert not group_too_old(args, group, 3)
     assert not group_too_old(args, _versioned_group(2), 4)
@@ -793,7 +793,7 @@ def test_group_age_helpers_follow_nemo_replay_buffer():
 @pytest.mark.unit
 def test_collector_replaces_too_old_groups_to_fill_the_step(monkeypatch):
     """Old groups are dropped whole and collection goes on until the step has its groups;
-    flat groups are checked first and count against the flat budget (NeMo order)."""
+    flat groups are checked first and count against the flat budget."""
     from types import SimpleNamespace
 
     from slime.rollout import fully_async_rollout
@@ -834,7 +834,7 @@ def test_collector_replaces_too_old_groups_to_fill_the_step(monkeypatch):
 @pytest.mark.unit
 def test_dispatch_weight_version_stamp_is_the_group_version():
     """in_place pause: SGLang reports the version a request ended with, so the dispatch stamp
-    (first one kept across resumes) is the group's NeMo generation_weight_version."""
+    (first one kept across resumes) is the group's start version."""
     from types import SimpleNamespace
 
     from slime.rollout.fully_async_rollout import (

@@ -589,7 +589,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=float,
                 default=None,
                 help=(
-                    "Fully-async rollout only (NeMo-RL drop_flat_groups): drop flat groups (kept rewards "
+                    "Fully-async rollout only: drop flat groups (kept rewards "
                     "spread <= 1e-6, or fewer than 2 kept samples) until int(frac * rollout_batch_size) "
                     "are dropped in a rollout; later flat groups train. None disables it."
                 ),
@@ -601,9 +601,8 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "SGLang pause_generation mode around weight updates. abort (default): running "
                     "requests are aborted and resumed later, the cache is flushed. in_place: requests "
-                    "stay in the engine and continue with their KV cache after the update (NeMo-RL "
-                    "in_flight_weight_updates with recompute_kv_cache_after_weight_updates false); "
-                    "the cache is not flushed (SGLang refuses with requests running)."
+                    "stay in the engine and continue with their existing KV cache after the update "
+                    "(not recomputed); the cache is not flushed (SGLang refuses with requests running)."
                 ),
             )
             parser.add_argument(
@@ -611,7 +610,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 type=int,
                 default=None,
                 help=(
-                    "Fully-async rollout only (NeMo-RL async_grpo.max_trajectory_age_steps): a group is "
+                    "Fully-async rollout only: a group is "
                     "used only if trainer_weight_version - (weight version its generation started with) "
                     "<= this, judged when the rollout is collected for its training step; older groups "
                     "are dropped whole and collection continues until rollout_batch_size valid groups. "
@@ -736,6 +735,18 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "The called after we have all the rollout data including log_probs. "
                     "It may be helpful for updating loss mask."
+                ),
+            )
+            parser.add_argument(
+                "--pre-advantage-hook-path",
+                type=str,
+                default=None,
+                help=(
+                    "Function `hook(args, rollout_id, rollout_data)` called on every trainer rank after the "
+                    "log-prob passes and before advantages are computed. Loss-mask changes made here also "
+                    "leave the advantage whitening statistics (unlike --rollout-data-postprocess-path, which "
+                    "runs after the advantages). Call slime.utils.rollout_staleness._recompute_rollout_mask_sums "
+                    "after editing loss_masks."
                 ),
             )
             parser.add_argument(
@@ -1255,18 +1266,8 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=False,
                 help=(
                     "Advance the LR/WD scheduler once per rollout (by one global batch) instead of once "
-                    "per optimizer step, as NeMo-RL's Megatron worker does: all updates of a rollout use "
+                    "per optimizer step: all updates of a rollout use "
                     "the same LR and --lr-warmup-iters / --lr-decay-iters / --lr-wsd-decay-iters count rollouts."
-                ),
-            )
-            parser.add_argument(
-                "--seq-logprob-error-threshold",
-                type=float,
-                default=None,
-                help=(
-                    "NeMo-RL seq_logprob_error_threshold: drop from the loss (and from the advantage "
-                    "whitening) every sequence whose mean exp(|train_logprob - rollout_logprob|) over "
-                    "its loss tokens exceeds this value."
                 ),
             )
             parser.add_argument(
@@ -1275,7 +1276,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default="all_rollouts",
                 help=(
                     "Divisor of the per-rollout-mean loss: every rollout of the step (default) or only "
-                    "rollouts with at least one loss token, summed over DP (NeMo-RL sum(sample_mask)). "
+                    "rollouts with at least one loss token, summed over DP. "
                     "The LR scheduler always counts all rollouts."
                 ),
             )

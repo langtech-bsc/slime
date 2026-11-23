@@ -234,7 +234,7 @@ class AsyncRolloutWorker:
         self.metrics = FullyAsyncMetrics()
         # --sglang-pause-generation-mode in_place: a request spans weight updates without being
         # aborted, so SGLang reports only the version it ended with. Stamp each sample with the
-        # engines' version when its generation is dispatched (NeMo's generation_weight_version).
+        # engines' version when its generation is dispatched.
         self._stamp_dispatch_version = getattr(args, "sglang_pause_generation_mode", "abort") == "in_place"
         self._weight_version_url = _weight_version_url(args) if self._stamp_dispatch_version else None
         self._weight_version: str | None = None
@@ -937,12 +937,12 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> Rollout
     last_log = started
     LOG_EVERY = 30.0
 
-    # NeMo-RL drop_flat_groups: drop up to ``max_frac * target`` flat groups per
+    # --flat-group-drop-max-frac: drop up to ``max_frac * target`` flat groups per
     # rollout (zero advantage, no signal) and keep collecting; later flat groups train.
     flat_max_frac = getattr(args, "flat_group_drop_max_frac", None)
     flat_drop_budget = int(flat_max_frac * target) if flat_max_frac is not None else 0
     flat_dropped = 0
-    # NeMo-RL max_trajectory_age_steps: groups too old for this rollout's training step are
+    # --group-max-age-steps: groups too old for this rollout's training step are
     # dropped whole and collection goes on, so the step still gets ``target`` groups.
     target_version = group_age_target_version(args, rollout_id)
     stale_dropped = 0
@@ -952,8 +952,8 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> Rollout
         drained = 0
         for gid, group in worker.get_completed_groups():
             drained += 1
-            # NeMo drops flat groups when they are generated and old ones when the step samples
-            # its buffer, so a group that is both counts against the flat budget.
+            # The flat check comes first: a group that is both flat and too old counts
+            # against the flat budget.
             if flat_dropped < flat_drop_budget and is_flat_group(args, group):
                 flat_dropped += 1
                 continue
@@ -1122,7 +1122,7 @@ def _sample_start_weight_version(sample: Sample) -> int | None:
 
 
 def group_start_weight_version(group: list[Sample | list[Sample]]) -> int | None:
-    """Oldest weight version any sample of the group started generating with (NeMo's group version):
+    """Oldest weight version any sample of the group started generating with:
     the dispatch stamp when there is one, else the version of its first generated chunk."""
     versions = [
         version
@@ -1134,7 +1134,7 @@ def group_start_weight_version(group: list[Sample | list[Sample]]) -> int | None
 
 
 def group_too_old(args, group: list[Sample | list[Sample]], target_version: int | None) -> bool:
-    """NeMo ReplayBuffer validity: ``target_version - start_version > max_age`` means too old."""
+    """``target_version - start_version > group_max_age_steps`` means too old."""
     if target_version is None:
         return False
     start = group_start_weight_version(group)
@@ -1142,7 +1142,7 @@ def group_too_old(args, group: list[Sample | list[Sample]], target_version: int 
 
 
 def is_flat_group(args, group: list[Sample | list[Sample]], tol: float = 1e-6) -> bool:
-    """NeMo-RL flat group: fewer than 2 kept attempts, or kept rewards spread <= tol.
+    """Flat group: fewer than 2 kept attempts, or kept rewards spread <= tol.
 
     Attempts with ``remove_sample`` (dropped from the loss) do not count. A
     multi-segment attempt is scored by its first segment, as in the publisher.

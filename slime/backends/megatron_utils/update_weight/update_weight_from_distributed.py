@@ -23,6 +23,7 @@ from slime.utils.weight_sync import (
 from ..megatron_to_hf import convert_to_hf
 from ..sglang import DeltaSpec
 from .common import all_gather_param, named_params_and_buffers
+from .pause_mode import flush_cache_after_pause
 
 
 class UpdateWeightFromDistributed:
@@ -112,7 +113,8 @@ class UpdateWeightFromDistributed:
 
         if dist.get_rank() == 0:
             ray.get([engine.pause_generation.remote() for engine in self.rollout_engines])
-            ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
+            if flush_cache_after_pause(self.args):
+                ray.get([engine.flush_cache.remote() for engine in self.rollout_engines])
 
             # int4/fp4 pre_process
             if self.quantization_config and self.quantization_config["quant_method"] in ["compressed-tensors"]:

@@ -232,6 +232,13 @@ class AsyncRolloutWorker:
         self.worker_thread: threading.Thread | None = None
         self.state = GenerateState(args)
         self.metrics = FullyAsyncMetrics()
+        # --sglang-pause-generation-mode in_place: a request spans weight updates without being
+        # aborted, so SGLang reports only the version it ended with. Stamp each sample with the
+        # engines' version when its generation is dispatched.
+        self._stamp_dispatch_version = getattr(args, "sglang_pause_generation_mode", "abort") == "in_place"
+        self._weight_version_url = _weight_version_url(args) if self._stamp_dispatch_version else None
+        self._weight_version: str | None = None
+        self._weight_version_polled_at = 0.0
 
     # -- public --------------------------------------------------------------
 
@@ -445,6 +452,9 @@ class AsyncRolloutWorker:
                     group_state = groups.get(gid)
                     if group_state is None or group_state.dropped:
                         continue
+                    if self._stamp_dispatch_version:
+                        await self._refresh_weight_version()
+                        stamp_dispatch_weight_version(sample, self._weight_version)
                     task = asyncio.create_task(self._generate_sample(sample, sample_idx))
                     active_generation[task] = (gid, sample_idx)
 
@@ -463,6 +473,21 @@ class AsyncRolloutWorker:
                 await asyncio.wait(active_tasks, timeout=30)
             except Exception:  # noqa: BLE001
                 pass
+
+    async def _refresh_weight_version(self, max_age_s: float = 2.0) -> None:
+        """Engines' current weight version, re-read at most every ``max_age_s`` (all engines are
+        paused, updated and continued together). A failed read keeps the last known version."""
+        now = time.monotonic()
+        if self._weight_version_url is None or now - self._weight_version_polled_at < max_age_s:
+            return
+        self._weight_version_polled_at = now
+        try:
+            version = await asyncio.to_thread(_fetch_weight_version, self._weight_version_url)
+        except Exception as error:  # noqa: BLE001
+            logger.warning("fully-async: could not read the engines' weight version: %s", error)
+            return
+        if version is not None:
+            self._weight_version = version
 
     async def _generate_sample(self, sample: Sample, sample_idx: int) -> Sample | list[Sample]:
         if sample.status in {Sample.Status.COMPLETED, Sample.Status.TRUNCATED}:
@@ -500,10 +525,22 @@ class AsyncRolloutWorker:
             getattr(sample, "response_length", 0) or 0 for sample in _iter_samples(generated)
         )
         self.backpressure.record_generated(generated_count)
-        if _contains_aborted(generated):
+        if group.aborted or _contains_aborted(generated):
+            # Requeue only once every sample of the group is back: requeueing at the first
+            # aborted sample shared the Sample objects with sibling generations still in
+            # flight, which kept appending to them (responses past rollout_max_response_len).
+            group.aborted = True
+            if group.generated_count < len(group.samples):
+                return
             group.dropped = True
             for sample in group.samples:
-                sample.mark_pending_for_trajectory_resume()
+                if sample.status == Sample.Status.ABORTED:
+                    sample.mark_pending_for_trajectory_resume()
+                else:
+                    # Finished before the abort: keep the trajectory (generating again would
+                    # continue past its stop token); it is scored again when the group returns.
+                    sample.reward = None
+                    sample.remove_sample = False
             try:
                 self.data_buffer.add_samples([group.samples])
             except Exception:  # noqa: BLE001
@@ -900,12 +937,30 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> Rollout
     last_log = started
     LOG_EVERY = 30.0
 
+    # --flat-group-drop-max-frac: drop up to ``max_frac * target`` flat groups per
+    # rollout (zero advantage, no signal) and keep collecting; later flat groups train.
+    flat_max_frac = getattr(args, "flat_group_drop_max_frac", None)
+    flat_drop_budget = int(flat_max_frac * target) if flat_max_frac is not None else 0
+    flat_dropped = 0
+    # --group-max-age-steps: groups too old for this rollout's training step are
+    # dropped whole and collection goes on, so the step still gets ``target`` groups.
+    target_version = group_age_target_version(args, rollout_id)
+    stale_dropped = 0
+
     while len(collected) < target:
         # Pull whatever's done.
         drained = 0
         for gid, group in worker.get_completed_groups():
-            collected[gid] = group
             drained += 1
+            # The flat check comes first: a group that is both flat and too old counts
+            # against the flat budget.
+            if flat_dropped < flat_drop_budget and is_flat_group(args, group):
+                flat_dropped += 1
+                continue
+            if group_too_old(args, group, target_version):
+                stale_dropped += 1
+                continue
+            collected[gid] = group
 
         if not drained:
             await asyncio.sleep(0.05)
@@ -933,7 +988,20 @@ async def _generate_rollout_async(args, rollout_id: int, data_buffer) -> Rollout
         time.time() - started,
         worker.queue_size(),
     )
-    return RolloutFnTrainOutput(samples=out, metrics=worker.collect_metrics())
+    metrics = worker.collect_metrics()
+    if target_version is not None:
+        metrics["rollout/stale_groups_dropped"] = stale_dropped
+        logger.info(
+            "fully-async rollout %d: dropped %d groups older than %d steps (target trainer version %d)",
+            rollout_id,
+            stale_dropped,
+            args.group_max_age_steps,
+            target_version,
+        )
+    if flat_max_frac is not None:
+        metrics["rollout/flat_groups_dropped"] = flat_dropped
+        logger.info("fully-async rollout %d: dropped %d flat groups (budget %d)", rollout_id, flat_dropped, flat_drop_budget)
+    return RolloutFnTrainOutput(samples=out, metrics=metrics)
 
 
 def generate_rollout_fully_async(args, rollout_id, data_buffer, evaluation: bool = False):
@@ -955,6 +1023,7 @@ class GroupState:
     active_reward_count: int = 0
     rewarded_count: int = 0
     dropped: bool = False
+    aborted: bool = False
 
     def __post_init__(self) -> None:
         self.generated_units = [None] * len(self.samples)
@@ -995,6 +1064,98 @@ class FullyAsyncMetrics:
             "fully_async/generated_samples": self.generated_samples,
             "fully_async/rewarded_samples": self.rewarded_samples,
         }
+
+
+def group_age_target_version(args, rollout_id: int) -> int | None:
+    """Trainer weight version rollout ``rollout_id`` will be trained with (``--group-max-age-steps``).
+
+    ``None`` until the first ``prepare_train_data`` records the offset (the first rollout is
+    generated with the initial weights, so nothing in it can be too old).
+    """
+    if getattr(args, "group_max_age_steps", None) is None:
+        return None
+    if getattr(args, "update_weights_interval", 1) != 1:
+        raise ValueError("--group-max-age-steps needs one weight update per rollout (update_weights_interval=1)")
+    offset = getattr(args, "group_age_trainer_version_offset", None)
+    return None if offset is None else int(offset) + int(rollout_id)
+
+
+DISPATCH_WEIGHT_VERSION_KEY = "dispatch_weight_version"
+
+
+def _weight_version_url(args) -> str | None:
+    engines = getattr(args, "rollout_external_engine_infos", None) or []
+    if engines and engines[0].get("url"):
+        return f"{engines[0]['url'].rstrip('/')}/get_weight_version"
+    router_ip, router_port = getattr(args, "sglang_router_ip", None), getattr(args, "sglang_router_port", None)
+    return f"http://{router_ip}:{router_port}/get_weight_version" if router_ip and router_port else None
+
+
+def _fetch_weight_version(url: str, timeout: float = 5.0) -> str | None:
+    import requests
+
+    response = requests.get(url, timeout=timeout)
+    response.raise_for_status()
+    version = response.json().get("weight_version")
+    return None if version is None else str(version)
+
+
+def stamp_dispatch_weight_version(sample: Sample, version: str | None) -> None:
+    """Record the version a sample's generation started with; a resumed sample keeps its first."""
+    if version is None:
+        return
+    if not isinstance(sample.metadata, dict):
+        sample.metadata = {}
+    sample.metadata.setdefault(DISPATCH_WEIGHT_VERSION_KEY, str(version))
+
+
+def _sample_start_weight_version(sample: Sample) -> int | None:
+    stamped = sample.metadata.get(DISPATCH_WEIGHT_VERSION_KEY) if isinstance(sample.metadata, dict) else None
+    for version in (stamped, sample.weight_versions[0] if sample.weight_versions else None):
+        if version is None:
+            continue
+        try:
+            return int(version)
+        except (TypeError, ValueError):
+            continue
+    return None
+
+
+def group_start_weight_version(group: list[Sample | list[Sample]]) -> int | None:
+    """Oldest weight version any sample of the group started generating with:
+    the dispatch stamp when there is one, else the version of its first generated chunk."""
+    versions = [
+        version
+        for unit in group
+        for sample in _iter_samples(unit)
+        if (version := _sample_start_weight_version(sample)) is not None
+    ]
+    return min(versions) if versions else None
+
+
+def group_too_old(args, group: list[Sample | list[Sample]], target_version: int | None) -> bool:
+    """``target_version - start_version > group_max_age_steps`` means too old."""
+    if target_version is None:
+        return False
+    start = group_start_weight_version(group)
+    return start is not None and target_version - start > args.group_max_age_steps
+
+
+def is_flat_group(args, group: list[Sample | list[Sample]], tol: float = 1e-6) -> bool:
+    """Flat group: fewer than 2 kept attempts, or kept rewards spread <= tol.
+
+    Attempts with ``remove_sample`` (dropped from the loss) do not count. A
+    multi-segment attempt is scored by its first segment, as in the publisher.
+    """
+    rewards = []
+    for unit in group:
+        sample = unit[0] if isinstance(unit, list) else unit
+        if sample.remove_sample:
+            continue
+        rewards.append(float(sample.get_reward_value(args)))
+    if len(rewards) < 2:
+        return True
+    return max(rewards) - min(rewards) <= tol
 
 
 def _contains_aborted(sample_or_group: Sample | list[Sample]) -> bool:

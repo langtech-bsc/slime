@@ -582,6 +582,20 @@ class RolloutManager:
             # if debug rollout only, we don't convert samples to train data and directly return
             return
         data = rollout_payload["data"] if isinstance(rollout_payload, dict) else rollout_payload
+        if getattr(self.args, "group_max_age_steps", None) is not None and trainer_weight_version is not None:
+            # --group-max-age-steps: the collector of rollout r targets trainer version offset + r
+            # (one weight update per rollout). prepare(r) runs before collect(r + 1) on this actor.
+            offset = int(trainer_weight_version) - int(rollout_id)
+            previous = getattr(self.args, "group_age_trainer_version_offset", None)
+            if previous is not None and previous != offset:
+                logger.warning(
+                    "--group-max-age-steps: trainer version offset changed %s -> %s at rollout %s "
+                    "(not one weight update per rollout); group ages of the next rollout use the new one",
+                    previous,
+                    offset,
+                    rollout_id,
+                )
+            self.args.group_age_trainer_version_offset = offset
         data, filter_metrics = _filter_rollout_groups_for_training(
             self.args,
             data,

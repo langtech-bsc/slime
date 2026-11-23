@@ -329,6 +329,45 @@ def test_trims_trailing_rollouts_that_dont_fill_a_step():
 
 
 @pytest.mark.unit
+def test_train_partial_last_step_keeps_trailing_rollouts():
+    """Same 5 rollouts with --train-partial-last-step: a third, smaller step holds rollout 4
+    (job 49262478 dropped 504 of 1016 samples when 1016 < 2 x 512)."""
+    rollout_indices = [0, 0, 1, 2, 2, 3, 4, 4]
+    total_lengths = [3] * 8
+    args = make_args(use_dynamic_batch_size=True, max_tokens_per_gpu=12)
+    args.train_partial_last_step = True
+
+    partitions, mbi, nmb, gbs_per_step = build_dp_schedule(
+        args, make_tp(dp_size=1), total_lengths, global_batch_size=2, rollout_indices=rollout_indices
+    )
+
+    assert gbs_per_step == [2, 2, 1]
+    assert_invariants(
+        partitions,
+        mbi,
+        nmb,
+        dp_size=1,
+        expected_global_sample_indices=range(8),
+        total_lengths=total_lengths,
+        max_per_bin=12,
+    )
+
+
+@pytest.mark.unit
+def test_train_partial_last_step_drops_remainder_below_dp_size():
+    """A leftover smaller than one sample per DP rank cannot form a step: still dropped."""
+    rollout_indices = [0, 1, 2, 3, 4]
+    args = make_args(use_dynamic_batch_size=True, max_tokens_per_gpu=12)
+    args.train_partial_last_step = True
+
+    _, _, _, gbs_per_step = build_dp_schedule(
+        args, make_tp(dp_size=2), [3] * 5, global_batch_size=2, rollout_indices=rollout_indices
+    )
+
+    assert gbs_per_step == [2, 2]
+
+
+@pytest.mark.unit
 def test_partial_step_when_fewer_rollouts_than_gbs():
     """gbs=4 with only 3 distinct rollouts → one partial step of size 3."""
     args = make_args(use_dynamic_batch_size=True, max_tokens_per_gpu=12)

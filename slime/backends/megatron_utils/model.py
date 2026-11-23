@@ -465,6 +465,7 @@ def train_one_step(
     num_microbatches: int,
     step_global_batch_size: int,
     microbatch_pbar=None,
+    loss_denominator: int | None = None,
 ) -> tuple[dict[str, float], float]:
     """Execute a single pipeline-parallel training step.
 
@@ -488,11 +489,17 @@ def train_one_step(
             ``increment``. In the common case (1 rollout = 1 sample) this
             equals the per-step sample count, so behavior is unchanged.
 
+        loss_denominator (int | None): Divisor of the per-rollout-mean loss
+            and of the reported train metrics when it differs from
+            ``step_global_batch_size`` (``--loss-normalizer valid_rollouts``).
+            The LR scheduler still steps by ``step_global_batch_size``.
+
     Returns:
         tuple[dict[str, float], float]: Reduced loss dictionary (last stage only)
         and gradient norm for logging.
     """
     args = get_args()
+    loss_divisor = step_global_batch_size if loss_denominator is None else loss_denominator
 
     # Set grad to zero.
     for model_chunk in model:
@@ -583,7 +590,7 @@ def train_one_step(
         if os.environ.get("ENABLE_ROUTING_REPLAY", "0") == "1":
             os.environ["ROUTING_REPLAY_STAGE"] = old_stage
 
-        return output_tensor, partial(loss_function, args, batch, num_microbatches, step_global_batch_size)
+        return output_tensor, partial(loss_function, args, batch, num_microbatches, loss_divisor)
 
     # Forward pass.
     forward_backward_func = get_forward_backward_func()
@@ -648,7 +655,8 @@ def train_one_step(
         # Update learning rate. Use the per-step global_batch_size when dynamic
         # batching is on so the scheduler's samples-seen counter tracks reality.
         assert update_successful
-        opt_param_scheduler.step(increment=step_global_batch_size)
+        if not args.lr_schedule_step_per_rollout:
+            opt_param_scheduler.step(increment=step_global_batch_size)
 
     # release grad
     for model_chunk in model:
@@ -659,7 +667,7 @@ def train_one_step(
         loss_reduced = reduce_train_step_metrics(
             losses_reduced,
             calculate_per_token_loss=args.calculate_per_token_loss,
-            step_global_batch_size=step_global_batch_size,
+            step_global_batch_size=loss_divisor,
             cp_size=mpu.get_context_parallel_world_size(),
             dp_with_cp_group=mpu.get_data_parallel_group(with_context_parallel=True),
         )
@@ -727,6 +735,7 @@ def train(
     data_iterator: Sequence[DataIterator],
     num_microbatches: Sequence[int],
     global_batch_sizes: Sequence[int],
+    loss_denominators: Sequence[int] | None = None,
 ) -> None:
     """Run training over a rollout consisting of multiple steps.
 
@@ -852,6 +861,7 @@ def train(
             step_num_microbatches,
             global_batch_sizes[step_id],
             microbatch_pbar=microbatch_pbar,
+            loss_denominator=None if loss_denominators is None else loss_denominators[step_id],
         )
 
         if step_id == 0:
@@ -962,6 +972,10 @@ def train(
                 ), f"grad norm mismatch: {grad_norm} != {expected_grad_norm}"
         step_start_microbatch += step_num_microbatches
     microbatch_pbar.close()
+    if args.lr_schedule_step_per_rollout:
+        # One scheduler step per train() call: every update of the rollout uses the same LR,
+        # and --lr-*-iters count rollouts (one global batch each).
+        opt_param_scheduler.step(increment=args.global_batch_size)
     # Close out pre-hooks if using distributed optimizer and overlapped param gather.
     if pre_hook_enabled:
         disable_forward_pre_hook(model)

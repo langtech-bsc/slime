@@ -17,6 +17,26 @@ from slime.utils.logging_utils import configure_logger
 logger = logging.getLogger(__name__)
 
 
+
+def add_yarn_arguments(parser):
+    """Dense-model YaRN RoPE. Megatron's GPTModel supports position_embedding_type="yarn",
+    but only the GPT-OSS builder sets its parameters; there is no CLI path. Setting the
+    scaling factor switches the model to YaRN with these values (HF rope_parameters).
+    Shared with tools/convert_hf_to_torch_dist.py, which builds the same model."""
+    parser.add_argument("--yarn-rotary-scaling-factor", type=float, default=None)
+    parser.add_argument("--yarn-original-max-position-embeddings", type=int, default=None)
+    parser.add_argument("--yarn-beta-fast", type=float, default=32.0)
+    parser.add_argument("--yarn-beta-slow", type=float, default=1.0)
+    parser.add_argument("--yarn-mscale", type=float, default=1.0)
+    parser.add_argument("--yarn-mscale-all-dim", type=float, default=0.0)
+    parser.add_argument(
+        "--yarn-truncate",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="HF rope_parameters.truncate: round the YaRN correction range to integers.",
+    )
+    return parser
+
 def reset_arg(parser, name, **kwargs):
     """
     Reset the default value of a Megatron argument.
@@ -224,6 +244,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Example: 'my_module.my_model_provider'."
                 ),
             )
+            add_yarn_arguments(parser)
             parser.add_argument(
                 "--recompute-loss-function",
                 action="store_true",
@@ -563,6 +584,48 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "You could use `slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std` as an example."
                 ),
             )
+            parser.add_argument(
+                "--flat-group-drop-max-frac",
+                type=float,
+                default=None,
+                help=(
+                    "Fully-async rollout only: drop flat groups (kept rewards "
+                    "spread <= 1e-6, or fewer than 2 kept samples) until int(frac * rollout_batch_size) "
+                    "are dropped in a rollout; later flat groups train. None disables it."
+                ),
+            )
+            parser.add_argument(
+                "--sglang-pause-generation-mode",
+                choices=["abort", "retract", "in_place"],
+                default="abort",
+                help=(
+                    "SGLang pause_generation mode around weight updates. abort (default): running "
+                    "requests are aborted and resumed later, the cache is flushed. in_place: requests "
+                    "stay in the engine and continue with their existing KV cache after the update "
+                    "(not recomputed); the cache is not flushed (SGLang refuses with requests running)."
+                ),
+            )
+            parser.add_argument(
+                "--group-max-age-steps",
+                type=int,
+                default=None,
+                help=(
+                    "Fully-async rollout only: a group is "
+                    "used only if trainer_weight_version - (weight version its generation started with) "
+                    "<= this, judged when the rollout is collected for its training step; older groups "
+                    "are dropped whole and collection continues until rollout_batch_size valid groups. "
+                    "Needs one weight update per rollout. None disables it."
+                ),
+            )
+            parser.add_argument(
+                "--train-partial-last-step",
+                action="store_true",
+                default=False,
+                help=(
+                    "Train the rollouts left after the full global batches as one smaller last step "
+                    "instead of dropping them (default: dropped)."
+                ),
+            )
 
             # partial rollout
             parser.add_argument(
@@ -672,6 +735,18 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help=(
                     "The called after we have all the rollout data including log_probs. "
                     "It may be helpful for updating loss mask."
+                ),
+            )
+            parser.add_argument(
+                "--pre-advantage-hook-path",
+                type=str,
+                default=None,
+                help=(
+                    "Function `hook(args, rollout_id, rollout_data)` called on every trainer rank after the "
+                    "log-prob passes and before advantages are computed. Loss-mask changes made here also "
+                    "leave the advantage whitening statistics (unlike --rollout-data-postprocess-path, which "
+                    "runs after the advantages). Call slime.utils.rollout_staleness._recompute_rollout_mask_sums "
+                    "after editing loss_masks."
                 ),
             )
             parser.add_argument(
@@ -1184,6 +1259,26 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 action="store_true",
                 default=False,
                 help="Enable TIS from https://fengyao.notion.site/off-policy-rl for off-policy importance sampling.",
+            )
+            parser.add_argument(
+                "--lr-schedule-step-per-rollout",
+                action="store_true",
+                default=False,
+                help=(
+                    "Advance the LR/WD scheduler once per rollout (by one global batch) instead of once "
+                    "per optimizer step: all updates of a rollout use "
+                    "the same LR and --lr-warmup-iters / --lr-decay-iters / --lr-wsd-decay-iters count rollouts."
+                ),
+            )
+            parser.add_argument(
+                "--loss-normalizer",
+                choices=["all_rollouts", "valid_rollouts"],
+                default="all_rollouts",
+                help=(
+                    "Divisor of the per-rollout-mean loss: every rollout of the step (default) or only "
+                    "rollouts with at least one loss token, summed over DP. "
+                    "The LR scheduler always counts all rollouts."
+                ),
             )
             parser.add_argument(
                 "--tis-clip",

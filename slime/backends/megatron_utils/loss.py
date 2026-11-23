@@ -843,7 +843,10 @@ def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) 
             assert (
                 all_advs.size() == all_masks.size()
             ), f"Shape mismatch before whitening: advantages {all_advs.size()}, masks {all_masks.size()}"
-            dp_group = mpu.get_data_parallel_group()
+            # Under CP each rank holds only its token chunks of every sequence, so the
+            # whitening statistics must be reduced over DP x CP; over DP alone every CP
+            # rank would whiten with different (partial) mean and variance.
+            dp_group = mpu.get_data_parallel_group(with_context_parallel=True)
 
             whitened_advs_flat = distributed_masked_whiten(
                 all_advs,

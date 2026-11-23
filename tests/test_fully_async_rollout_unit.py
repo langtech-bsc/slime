@@ -310,6 +310,61 @@ def test_fully_async_requeued_aborted_group_preserves_trajectory_for_resume(monk
 
 
 @pytest.mark.unit
+def test_fully_async_aborted_group_waits_for_siblings_and_keeps_finished_samples(monkeypatch):
+    """An abort requeues the group only after every sibling is back, and resumes only the
+    aborted samples: a finished one generating again continued past its stop token (2026-11-20:
+    25-32% of samples had <|im_end|> mid-response), and requeueing at the first abort shared
+    Sample objects with in-flight generations (responses past rollout_max_response_len)."""
+    from collections import deque
+
+    from slime.rollout import fully_async_rollout
+
+    monkeypatch.setattr(fully_async_rollout, "GenerateState", _FakeGenerateState)
+
+    data_source = _FiniteDataSource(groups=0, group_size=3)
+    worker = AsyncRolloutWorker(
+        _args(rollout_max_response_len=10, rollout_max_context_len=16),
+        data_source,
+        generation_concurrency=1,
+        reward_concurrency=1,
+        max_reward_backlog_groups=8,
+        max_inference_groups=99,
+        max_reward_groups=99,
+    )
+    finished, aborted, in_flight = (Sample(index=i, prompt="p") for i in (1, 2, 3))
+    finished.status = Sample.Status.COMPLETED
+    finished.reward = 0.5
+    aborted.status = Sample.Status.ABORTED
+    group = GroupState(gid=1, samples=[finished, aborted, in_flight])
+    groups = {1: group}
+    pending_reward = deque()
+
+    async def ret(s):
+        return s
+
+    async def run_case():
+        for idx, s in ((0, finished), (1, aborted)):
+            task = asyncio.create_task(ret(s))
+            await task
+            await worker._handle_generation_done(task, 1, idx, groups, pending_reward)
+        # the in-flight sibling is not back yet: nothing requeued, its Sample not shared
+        assert data_source.requeued == [] and 1 in groups
+        in_flight.status = Sample.Status.ABORTED
+        task = asyncio.create_task(ret(in_flight))
+        await task
+        await worker._handle_generation_done(task, 1, 2, groups, pending_reward)
+
+    asyncio.run(run_case())
+
+    assert groups == {}
+    assert data_source.requeued == [[finished, aborted, in_flight]]
+    assert finished.status == Sample.Status.COMPLETED and finished.reward is None
+    assert aborted.status == Sample.Status.PENDING and in_flight.status == Sample.Status.PENDING
+    # only the sample that finished before the abort was handed to the reward stage
+    assert [item[1] for item in pending_reward] == [0]
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize("empty_trajectory", [False, True])
 def test_fully_async_drops_invalid_generated_unit_before_reward(monkeypatch, empty_trajectory):
     from collections import deque
@@ -694,3 +749,111 @@ def test_fully_async_reward_group_cap_blocks_new_group(monkeypatch):
 
     asyncio.run(run_case())
     assert max_reward_groups_seen <= 2
+
+
+def _versioned_group(start_version, size=2, reward=None):
+    group = []
+    for i in range(size):
+        sample = Sample(index=i, prompt="p")
+        sample.weight_versions = [str(start_version), str(start_version + 1)]
+        sample.reward = float(i) if reward is None else reward
+        sample.status = Sample.Status.COMPLETED
+        group.append(sample)
+    return group
+
+
+@pytest.mark.unit
+def test_group_age_helpers():
+    from types import SimpleNamespace
+
+    from slime.rollout.fully_async_rollout import (
+        group_age_target_version,
+        group_start_weight_version,
+        group_too_old,
+    )
+
+    args = SimpleNamespace(group_max_age_steps=2)
+    # no prepare_train_data yet: the first rollout cannot hold old groups
+    assert group_age_target_version(args, 0) is None
+    args.group_age_trainer_version_offset = 1
+    assert group_age_target_version(args, 3) == 4
+    group = _versioned_group(2)
+    group[1].weight_versions = ["1", "2"]  # a resumed sample started earlier: the group is that old
+    assert group_start_weight_version(group) == 1
+    # valid iff target - start <= max_age (start = version the generation began with)
+    assert group_too_old(args, group, 4)
+    assert not group_too_old(args, group, 3)
+    assert not group_too_old(args, _versioned_group(2), 4)
+    assert not group_too_old(args, group, None)
+    with pytest.raises(ValueError):
+        group_age_target_version(SimpleNamespace(group_max_age_steps=2, update_weights_interval=2), 1)
+    assert group_age_target_version(SimpleNamespace(group_max_age_steps=None), 1) is None
+
+
+@pytest.mark.unit
+def test_collector_replaces_too_old_groups_to_fill_the_step(monkeypatch):
+    """Old groups are dropped whole and collection goes on until the step has its groups;
+    flat groups are checked first and count against the flat budget."""
+    from types import SimpleNamespace
+
+    from slime.rollout import fully_async_rollout
+
+    batches = [
+        [(1, _versioned_group(1)), (2, _versioned_group(3))],  # gid 1 too old for target 4
+        [(3, _versioned_group(1, reward=1.0)), (4, _versioned_group(2))],  # gid 3 old and flat
+        [(5, _versioned_group(4))],
+    ]
+
+    class _Worker:
+        def get_completed_groups(self):
+            return batches.pop(0) if batches else []
+
+        def queue_size(self):
+            return 0
+
+        def collect_metrics(self):
+            return {}
+
+    monkeypatch.setattr(fully_async_rollout, "_get_global_worker", lambda args, data_buffer: _Worker())
+    args = SimpleNamespace(
+        rollout_global_dataset=True,
+        rollout_batch_size=3,
+        group_max_age_steps=2,
+        group_age_trainer_version_offset=1,
+        flat_group_drop_max_frac=0.5,
+        reward_key=None,
+    )
+    out = asyncio.run(fully_async_rollout._generate_rollout_async(args, 3, data_buffer=None))
+
+    kept_starts = sorted(fully_async_rollout.group_start_weight_version(g) for g in out.samples)
+    assert kept_starts == [2, 3, 4]
+    assert out.metrics["rollout/stale_groups_dropped"] == 1
+    assert out.metrics["rollout/flat_groups_dropped"] == 1
+
+
+@pytest.mark.unit
+def test_dispatch_weight_version_stamp_is_the_group_version():
+    """in_place pause: SGLang reports the version a request ended with, so the dispatch stamp
+    (first one kept across resumes) is the group's start version."""
+    from types import SimpleNamespace
+
+    from slime.rollout.fully_async_rollout import (
+        _weight_version_url,
+        group_start_weight_version,
+        stamp_dispatch_weight_version,
+    )
+
+    group = _versioned_group(5)  # weight_versions ["5", "6"]: what SGLang reported at the end
+    stamp_dispatch_weight_version(group[0], "3")
+    stamp_dispatch_weight_version(group[0], "4")  # a resume does not overwrite the first stamp
+    stamp_dispatch_weight_version(group[1], None)  # unknown version: falls back to weight_versions
+    assert group[0].metadata["dispatch_weight_version"] == "3"
+    assert group_start_weight_version(group) == 3
+    group[1].metadata = None
+    stamp_dispatch_weight_version(group[1], "4")
+    assert group[1].metadata == {"dispatch_weight_version": "4"}
+
+    args = SimpleNamespace(rollout_external_engine_infos=[{"url": "http://10.0.0.1:31000/"}])
+    assert _weight_version_url(args) == "http://10.0.0.1:31000/get_weight_version"
+    args = SimpleNamespace(rollout_external_engine_infos=None, sglang_router_ip="r", sglang_router_port=9)
+    assert _weight_version_url(args) == "http://r:9/get_weight_version"
